@@ -6,12 +6,6 @@
         "version": "1.4.2"
     },
     {
-        "name": "拷贝漫画(多账号)",
-        "fileName": "copy_manga_multi_accounts.js",
-        "key": "copy_manga",
-        "version": "1.4.1"
-    },
-    {
         "name": "Komiic",
         "fileName": "komiic.js",
         "key": "Komiic",
@@ -63,12 +57,6 @@
         "description": "Forum login and comments are supported."
     },
     {
-        "name": "爱看漫",
-        "fileName": "ikmmh.js",
-        "key": "ikmmh",
-        "version": "1.0.6"
-    },
-    {
         "name": "少年ジャンプ＋",
         "fileName": "shonen_jump_plus.js",
         "key": "shonen_jump_plus",
@@ -85,12 +73,6 @@
         "fileName": "comick.js",
         "key": "comick",
         "version": "1.2.0"
-    },
-    {
-        "name": "优酷漫画",
-        "fileName": "ykmh.js",
-        "key": "ykmh",
-        "version": "1.0.0"
     },
     {
         "name": "再漫画",
@@ -127,12 +109,6 @@
         "fileName": "comic_walker.js",
         "key": "comic_walker",
         "version": "1.0.1"
-    },
-    {
-        "name": "漫画1234",
-        "fileName": "mh1234.js",
-        "key": "mh1234",
-        "version": "1.0.0"
     },
     {
         "name": "CCC追漫台",
@@ -187,13 +163,6 @@
         "fileName": "kavita.js",
         "key": "kavita",
         "version": "1.0.0"
-    },
-    {
-        "name": "嗨皮漫画",
-        "fileName": "happy.js",
-        "key": "happy",
-        "version": "1.0.0",
-        "description": "中国大陆及日韩IP无法访问，遇到403可以尝试切换其他地区网络"
     },
     {
         "name": "MYCOMIC",
