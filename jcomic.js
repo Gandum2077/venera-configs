@@ -126,7 +126,7 @@ class JComic extends ComicSource {
   name = "jcomic.net";
   key = "jcomic";
 
-  version = "1.0.0";
+  version = "1.0.1";
   minAppVersion = "1.4.6";
 
   url =
@@ -452,7 +452,23 @@ class JComic extends ComicSource {
 
       const doc = new HtmlDocument(resp.body);
       const imgs = doc.querySelectorAll("img.comic-thumb");
-      const images = Array.from(imgs).map((img) => img.attributes["src"]);
+      const images = Array.from(imgs).map((img) => {
+        const locked = img.attributes["data-locked"];
+        let imageUrl = img.attributes["src"];
+        if (locked) {
+          if (!locked.startsWith("JCOMIC_TRAPS_")) {
+            throw new Error("Unsupported jcomic image encoding");
+          }
+          const encoded = locked.slice("JCOMIC_TRAPS_".length)
+            .split("").reverse().join("");
+          imageUrl = Convert.decodeUtf8(Convert.decodeBase64(encoded));
+        }
+        if (!imageUrl || !/^https?:\/\//.test(imageUrl)) {
+          throw new Error("Invalid jcomic image URL");
+        }
+        return imageUrl;
+      });
+      if (!images.length) throw new Error("No jcomic chapter images found");
 
       return { images };
     },
