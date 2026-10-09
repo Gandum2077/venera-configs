@@ -5,7 +5,7 @@ class HComic extends ComicSource {
     // Unique id of the source
     key = "hcomic"
 
-    version = "1.0.0"
+    version = "1.1.0"
 
     minAppVersion = "1.6.0"
 
@@ -13,6 +13,100 @@ class HComic extends ComicSource {
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/hcomic.js"
 
     baseUrl = "https://h-comic.com"
+
+    apiUrl = "https://api.h-comic.com/api"
+
+    // Auth0 disables password grants for this site's client. Sign in on the
+    // website, then open /favourites after the site has stored its access-token cookie.
+    account = {
+        loginWithWebview: {
+            url: "https://h-comic.com/favourites",
+            checkStatus: (url, title) => {
+                if (/^https:\/\/h-comic\.auth0\.com\//.test(url)) {
+                    this.webLoginStarted = true;
+                }
+                return this.webLoginStarted === true &&
+                    /^https:\/\/h-comic\.com\/favourites(?:[?#]|$)/.test(url);
+            },
+            onLoginSuccess: () => {
+                const storage = this.loadData("_localStorage") || {};
+                const cookies = Network.getCookies(this.baseUrl);
+                const cookie = cookies.find(c => c.name === "auth0_token");
+                let token = cookie ? decodeURIComponent(cookie.value) : storage.auth0_token;
+                // Venera can return a decoded localStorage value.
+                if (typeof token === "string" && token.startsWith('"')) {
+                    token = JSON.parse(token);
+                }
+                if (typeof token !== "string" || !token) {
+                    this.deleteData("_localStorage");
+                    throw "未取得登录令牌，请完成网页登录后再打开收藏页";
+                }
+                this.saveData("token", token);
+                this.deleteData("_localStorage");
+                this.webLoginStarted = false;
+            },
+        },
+        logout: () => {
+            this.deleteData("token");
+            this.deleteData("_localStorage");
+            this.webLoginStarted = false;
+            Network.deleteCookies(this.baseUrl);
+            Network.deleteCookies("https://h-comic.auth0.com");
+        },
+    }
+
+    async apiRequest(method, path, data) {
+        const token = this.loadData("token");
+        if (!token) throw "Login expired";
+        const res = await Network.sendRequest(method, this.apiUrl + path, {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+        }, data === undefined ? null : JSON.stringify(data));
+        if (res.status === 401) {
+            this.deleteData("token");
+            throw "Login expired";
+        }
+        if (res.status < 200 || res.status >= 300) {
+            throw `H-Comic API status: ${res.status}`;
+        }
+        if (res.status === 204) return null;
+        try { return JSON.parse(res.body); }
+        catch (_) { throw "Invalid H-Comic API response"; }
+    }
+
+    async getComicRecord(id) {
+        const parts = id.split('|');
+        const html = await this.getHtml(`${this.baseUrl}/comics/${encodeURIComponent(parts.slice(1).join('|') || "view")}/1?id=${encodeURIComponent(parts[0])}`);
+        const data = this.extractData(html);
+        if (!data || !data.comic || !data.comic._id) {
+            throw "Failed to resolve H-Comic favorite ID";
+        }
+        return data.comic;
+    }
+
+    favorites = {
+        multiFolder: false,
+        loadComics: async (page, folder) => {
+            const result = await this.apiRequest("GET", `/favourites?page=${page}`);
+            if (!result || !Array.isArray(result.docs) ||
+                !Number.isInteger(result.pages) || result.pages < 0) {
+                throw "Invalid H-Comic favorites response";
+            }
+            const comics = result.docs.map(entry => {
+                if (!entry.comic || typeof entry.comic !== "object") {
+                    throw "Invalid H-Comic favorite comic";
+                }
+                return this.parseComic(entry.comic);
+            });
+            return { comics, maxPage: Math.max(1, result.pages) };
+        },
+        addOrDelFavorite: async (comicId, folderId, isAdding, favoriteId) => {
+            const c = await this.getComicRecord(comicId);
+            if (isAdding) await this.apiRequest("POST", "/favourites", { comicId: c._id });
+            else await this.apiRequest("DELETE", `/favourites/${encodeURIComponent(c._id)}`);
+            return "ok";
+        },
+    }
 
     /**
      * [Optional] init function
@@ -64,7 +158,7 @@ class HComic extends ComicSource {
     }
 
     parseComic(c) {
-        let title = c.title.display || c.title.pretty || c.title.japanese;
+        let title = c.title.display || c.title.pretty || c.title.japanese || c.title.english;
         let tags = c.tags ? c.tags.map(t => t.name_zh || t.name) : [];
         let updateTime = null;
         if (c.upload_date) {
@@ -76,7 +170,8 @@ class HComic extends ComicSource {
             id: `${c.id}|${title}`,
             title: title,
             subTitle: c.title.english,
-            cover: c.thumbnail,
+            cover: c.thumbnail || `https://h-comic.link/api/${c.comic_source}/${c.media_id}`,
+            favoriteId: c._id,
             tags: tags,
             description: "",
             updateTime: updateTime
@@ -253,7 +348,7 @@ class HComic extends ComicSource {
             if (!data || !data.comic) throw "Failed to load comic info";
             let c = data.comic;
 
-            let title = c.title.display || c.title.pretty || c.title.japanese;
+            let title = c.title.display || c.title.pretty || c.title.japanese || c.title.english;
             let subTitle = c.title.english;
             
             let cover = c.thumbnail;
