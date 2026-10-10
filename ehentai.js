@@ -7,7 +7,7 @@ class Ehentai extends ComicSource {
     // unique id of the source
     key = "ehentai"
 
-    version = "1.2.0"
+    version = "1.2.3"
 
     minAppVersion = "1.5.3"
 
@@ -58,15 +58,19 @@ class Ehentai extends ComicSource {
         }
         this.saveData("lastEventTime", newTime);
         const document = new HtmlDocument(res.body);
-        const eventPane = document.getElementById("eventpane");
-        if (eventPane == null) {
-            return;
+        try {
+            const eventPane = document.getElementById("eventpane");
+            if (eventPane == null) {
+                return;
+            }
+            const dawnInfo = eventPane.querySelector("div > p:nth-child(2)");
+            if (dawnInfo == null) {
+                return;
+            }
+            UI.showMessage(dawnInfo.text);
+        } finally {
+            document.dispose();
         }
-        const dawnInfo = eventPane.querySelector("div > p:nth-child(2)");
-        if (dawnInfo == null) {
-            return;
-        }
-        UI.showMessage(dawnInfo.text);
     }
 
     // [Optional] account related
@@ -100,7 +104,6 @@ class Ehentai extends ComicSource {
                 "ipb_member_id",
                 "ipb_pass_hash",
                 "igneous",
-                "star",
             ],
             /**
              * Validate cookies, return false if cookies are invalid.
@@ -110,15 +113,17 @@ class Ehentai extends ComicSource {
              * @returns {Promise<boolean>}
              */
             validate: async (values) => {
-                if (values.length !== 4) {
+                if (values.length < 2 || values.length > 3) {
                     return false
                 }
                 if (values[0].length === 0 || values[1].length === 0) {
                     return false
                 }
+                // igneous is optional and only used by ExHentai.
                 let cookies = []
                 for (let i = 0; i < values.length; i++) {
-                    cookies.push(new Cookie({
+                    if (!values[i]) continue
+                    if (i < 2) cookies.push(new Cookie({
                         name: this.account.loginWithCookies.fields[i],
                         value: values[i],
                         domain: ".e-hentai.org"
@@ -130,23 +135,26 @@ class Ehentai extends ComicSource {
                     }))
                 }
                 Network.deleteCookies('https://e-hentai.org')
-                Network.setCookies('https://e-hentai.org', cookies)
-                let res = await Network.get(
-                    "https://forums.e-hentai.org/",
-                    {
-                        "referer": "https://forums.e-hentai.org/index.php?",
-                        "accept":
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                        "accept-encoding": "gzip, deflate, br",
-                        "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
-                    });
+                Network.deleteCookies('https://exhentai.org')
+                Network.setCookies('https://e-hentai.org', cookies.filter((cookie) => cookie.domain === '.e-hentai.org'))
+                Network.setCookies('https://exhentai.org', cookies.filter((cookie) => cookie.domain === '.exhentai.org'))
+                // The forums can reject valid gallery cookies with a bot challenge.
+                // My Home redirects guests to the login page on e-hentai.org.
+                let res = await Network.get("https://e-hentai.org/home.php", {})
                 if (res.status !== 200) {
-                    return false
+                    throw `Login verification failed: HTTP ${res.status}`
+                }
+                if (/cf-chl-|Just a moment|Checking your browser/i.test(res.body)) {
+                    throw "Login verification blocked by an anti-bot challenge"
                 }
                 let document = new HtmlDocument(res.body)
-                let name = document.querySelector("div#userlinks > p.home > b > a");
-                document.dispose()
-                return name != null
+                try {
+                    return document.querySelectorAll("h1, h2").some(
+                        (heading) => heading.text.trim() === "Image Limits"
+                    )
+                } finally {
+                    document.dispose()
+                }
             }
         },
 
@@ -171,9 +179,9 @@ class Ehentai extends ComicSource {
         return this.baseUrl.includes("exhentai") ? "https://exhentai.org/api.php" : "https://api.e-hentai.org/api.php"
     }
 
-    getStarsFromPosition(position) {
+    getStarsFromPosition(position = "") {
         let i = 0;
-        while (position[i] !== ";") {
+        while (i < position.length && position[i] !== ";") {
             i++;
             if (i === position.length) {
                 break;
@@ -209,7 +217,7 @@ class Ehentai extends ComicSource {
         cookies.forEach((c) => {
             c.domain = '.exhentai.org'
         })
-        cookies.filter((item) => item.name !== 'igneous')
+        cookies = cookies.filter((item) => item.name !== 'igneous')
         Network.deleteCookies('https://exhentai.org')
         Network.setCookies('https://exhentai.org', cookies)
         throw `You may not have permission to access this page. Please check your network or try to login again.`
@@ -223,7 +231,7 @@ class Ehentai extends ComicSource {
      */
     async getGalleries(url, isLeaderBoard) {
         try {
-            this.checkEHEvent();
+            this.checkEHEvent().catch(() => {});
         } catch (_) {}
         let t = isLeaderBoard ? 1 : 0;
         let res
@@ -622,7 +630,7 @@ class Ehentai extends ComicSource {
          */
         loadFolders: async (comicId) => {
             try {
-                this.checkEHEvent();
+                this.checkEHEvent().catch(() => {});
             } catch (_) {}
             let res = await Network.get(`${this.baseUrl}/favorites.php`, {});
             if (res.status !== 200) {
@@ -674,7 +682,7 @@ class Ehentai extends ComicSource {
          */
         loadInfo: async (id) => {
             try {
-                this.checkEHEvent();
+                this.checkEHEvent().catch(() => {});
             } catch (_) {}
             let res = await Network.get(id, {
                 'cookie': 'nw=1'
