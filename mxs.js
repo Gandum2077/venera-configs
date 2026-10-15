@@ -2,8 +2,8 @@ class MXS extends ComicSource {
     // 漫画源基本信息
     name = "漫小肆";
     key = "mxs";
-    version = "1.0.0";
-    minAppVersion = "1.5.0";
+    version = "1.1.2";
+    minAppVersion = "1.5.3";
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/mxs.js";
 
     // 漫画源设置项
@@ -70,6 +70,191 @@ class MXS extends ComicSource {
     get baseUrl() {
         return this.loadSetting("domains");
     }
+
+    get requestHeaders() {
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": `${this.baseUrl}/`
+        };
+    }
+
+    // 仅允许站内地址，验证码需要和登录请求共用 Network 的 Cookie。
+    siteUrl(path, origin = this.baseUrl) {
+        if (typeof path !== "string" || !path) throw "页面缺少站内地址";
+        if (path.startsWith("/") && !path.startsWith("//")) return origin + path;
+        if (path.startsWith(origin + "/")) return path;
+        throw "页面返回了无效的站内地址";
+    }
+
+    sessionOrigin(url) {
+        const origin = typeof url === "string" ? url.match(/^https?:\/\/[^/?#]+/)?.[0] : null;
+        if (!this.settings.domains.options.some(domain => domain.value === origin)) throw "无效的会话域名";
+        return origin;
+    }
+
+    captureSessionCookies(url, required = true) {
+        const origin = this.sessionOrigin(url);
+        const cookies = Network.getCookies(origin + "/");
+        const sessionId = cookies.find(cookie => cookie.name === "PHPSESSID")?.value;
+        if (typeof sessionId !== "string" || !sessionId.trim()) {
+            if (required) throw "未取得 PHPSESSID，请重新登录";
+            return;
+        }
+        // www 域名仅需要 PHPSESSID，不要求或持久化 nav_switch。
+        this.saveData("sessionCookies", { PHPSESSID: sessionId });
+    }
+
+    restoreSessionCookies(url) {
+        const origin = this.sessionOrigin(url);
+        let saved = this.loadData("sessionCookies");
+        if (typeof saved?.PHPSESSID !== "string" || !saved.PHPSESSID.trim()) {
+            // 兼容升级前已经保存在 Cookie 容器中的登录状态。
+            this.captureSessionCookies(origin, false);
+            saved = this.loadData("sessionCookies");
+        }
+        if (typeof saved?.PHPSESSID !== "string" || !saved.PHPSESSID.trim()) return;
+        // 兼容旧版双 Cookie 数据，仅保留当前需要的会话标识。
+        if (Object.keys(saved).length !== 1) this.saveData("sessionCookies", { PHPSESSID: saved.PHPSESSID });
+        // 不复制原 domain，让宿主为当前域名创建 Cookie。
+        Network.setCookies(origin + "/", [
+            { name: "PHPSESSID", value: saved.PHPSESSID }
+        ]);
+    }
+
+    checkAccountPage(doc) {
+        if (doc.querySelector("#form-login") || doc.querySelector("input[name='password']") ||
+            doc.querySelector(".header_login a[href='/login']")) {
+            throw "Login expired: 请重新登录漫小肆";
+        }
+    }
+
+    async postAccountForm(path, fields, origin = this.baseUrl, restore = true) {
+        if (restore) this.restoreSessionCookies(origin);
+        const body = Object.keys(fields).map(key =>
+            `${encodeURIComponent(key)}=${encodeURIComponent(fields[key])}`).join("&");
+        const res = await Network.post(this.siteUrl(path, origin), {
+            ...this.requestHeaders,
+            "Referer": origin + "/",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest"
+        }, body, { maskDataInLog: true, maskHeadersInLog: ["Cookie", "cookie"], maskResponseInLog: true });
+        if (res.status === 401) throw "Login expired: HTTP 401，请重新登录漫小肆";
+        if (res.status !== 200) throw `请求失败: ${res.status}`;
+        let data;
+        try {
+            data = JSON.parse(res.body);
+        } catch (_) {
+            const doc = new HtmlDocument(res.body);
+            try { this.checkAccountPage(doc); } finally { doc.dispose(); }
+            throw "账号接口返回异常，可能遇到反爬验证，请尝试网页登录";
+        }
+        if (!data || typeof data !== "object" || String(data.err) !== "0") {
+            throw data?.msg || "账号操作失败";
+        }
+        if (restore) this.captureSessionCookies(origin, false);
+        return data;
+    }
+
+    // 原版 Venera 在注册源前解析 account，此处只能声明静态值和回调。
+    account = {
+        login: async (account, pwd) => {
+            if (!account || !pwd) throw "请输入账号和密码";
+            const origin = this.baseUrl;
+            // 新登录必须使用独立会话，不能在验证码生成后恢复旧 Cookie。
+            Network.deleteCookies(origin);
+            const doc = await this.fetchDocument(`${origin}/login`, false);
+            let captchaUrl;
+            try {
+                if (!doc.querySelector("#form-login")) throw "未找到登录表单，请尝试网页登录";
+                captchaUrl = this.siteUrl(doc.querySelector("#captcha")?.attributes?.src, origin);
+            } finally {
+                doc.dispose();
+            }
+            captchaUrl += (captchaUrl.includes("?") ? "&" : "?") + "rnd=" + Date.now();
+            const image = await Network.fetchBytes("GET", captchaUrl, { ...this.requestHeaders, "Referer": origin + "/" });
+            if (image.status !== 200) throw `验证码加载失败: ${image.status}`;
+            if (!image.body || !image.body.byteLength) throw "验证码图片为空，请重试";
+            const contentType = image.headers?.["content-type"] || image.headers?.["Content-Type"];
+            if (contentType && !String(contentType).toLowerCase().startsWith("image/")) {
+                throw "验证码响应不是图片，可能遇到反爬验证，请尝试网页登录";
+            }
+            const captcha = await UI.showInputDialog("验证码", value =>
+                value?.trim() ? null : "请输入验证码", image.body);
+            if (typeof captcha !== "string" || !captcha.trim()) throw "已取消登录";
+            await this.postAccountForm("/login", { username: account, password: pwd, captcha: captcha.trim() }, origin, false);
+            this.captureSessionCookies(origin);
+            return true;
+        },
+        loginWithWebview: {
+            // 固定入口不读取设置；完成后将会话 Cookie 复用到所选域名。
+            url: "https://www.mxshm.top/login",
+            checkStatus: (url, title) => {
+                // 网站登录成功后跳转 /ucenter；等待标题更新，避免在重定向前误判。
+                if (typeof url !== "string" || typeof title !== "string" || !title.trim() ||
+                    /登录|登入|login|验证码|安全验证|just a moment|checking your browser|access denied|错误|error|not found|404|403|forbidden/i.test(title)) return false;
+                const match = url.match(/^(https?:\/\/[^/?#]+)\/ucenter\/?(?:[?#].*)?$/);
+                if (!match || !this.settings.domains.options.some(domain => domain.value === match[1])) return false;
+                this.webLoginOrigin = match[1];
+                return true;
+            },
+            onLoginSuccess: () => {
+                // 原版宿主先导入 WebView Cookie，再同步调用此回调。
+                this.captureSessionCookies(this.webLoginOrigin || "https://www.mxshm.top");
+                this.restoreSessionCookies(this.baseUrl);
+            }
+        },
+        logout: () => {
+            this.deleteData("sessionCookies");
+            this.webLoginOrigin = null;
+            for (const domain of this.settings.domains.options) Network.deleteCookies(domain.value);
+            this.deleteData("account");
+        }
+    };
+
+    favorites = {
+        multiFolder: false,
+        loadComics: async (page) => {
+            if (!this.isLogged) throw "请先登录";
+            const doc = await this.fetchDocument(`${this.baseUrl}/bookshelf?page=${page}`);
+            try {
+                this.checkAccountPage(doc);
+                // user-booklist.js 通过 delfavors 和书架编辑按钮识别收藏列表。
+                if (doc.querySelector("#url_param")?.attributes?.value !== "delfavors" &&
+                    !doc.querySelector(".js_edit_booklist_btn")) {
+                    throw "未找到书架列表，可能遇到反爬验证或页面结构已变化";
+                }
+                if (!doc.querySelector(".mh-list")) throw "未找到书架列表，页面结构可能已变化";
+                const items = doc.querySelectorAll(".mh-list .mh-item");
+                const comics = this.parseComicList(items);
+                if (comics.length !== items.length) throw "书架漫画信息不完整，页面结构可能已变化";
+                let maxPage = page;
+                for (const link of doc.querySelectorAll(".pagination a[href*='page=']")) {
+                    const match = link.attributes.href.match(/[?&]page=(\d+)/);
+                    if (match) maxPage = Math.max(maxPage, parseInt(match[1]));
+                }
+                return { comics, maxPage };
+            } finally {
+                doc.dispose();
+            }
+        },
+        addOrDelFavorite: async (comicId, folderId, isAdding) => {
+            if (!this.isLogged) throw "请先登录";
+            const doc = await this.fetchDocument(`${this.baseUrl}/book/${encodeURIComponent(comicId)}`);
+            let current;
+            try {
+                this.checkAccountPage(doc);
+                current = doc.querySelector("#addfavor")?.attributes?.["data-val"];
+                if (current !== "0" && current !== "1") throw "无法读取漫画收藏状态";
+            } finally {
+                doc.dispose();
+            }
+            if ((current === "1") === isAdding) return true;
+            const data = await this.postAccountForm("/addfavor", { book_id: comicId, val: current });
+            if (String(data.isfavor) !== (isAdding ? "1" : "0")) throw "服务器返回的收藏状态与操作不符，请刷新后重试";
+            return true;
+        },
+        singleFolderForSingleComic: true
+    };
 
     // 解析普通漫画列表
     parseComicList(items) {
@@ -165,16 +350,19 @@ class MXS extends ComicSource {
     }
 
     // 执行网络请求并返回HTML文档对象
-    async fetchDocument(url) {
-        const res = await Network.get(url, {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        });
+    async fetchDocument(url, restore = true) {
+        if (restore) this.restoreSessionCookies(url);
+        const res = await Network.get(url, this.requestHeaders);
+        if (res.status === 401) throw "Login expired: HTTP 401，请重新登录漫小肆";
         
         if (res.status !== 200) {
             throw `请求失败: ${res.status}`;
         }
         
-        return new HtmlDocument(res.body);
+        const doc = new HtmlDocument(res.body);
+        if (restore && this.isLogged && !doc.querySelector("#form-login") &&
+            !doc.querySelector(".header_login a[href='/login']")) this.captureSessionCookies(url, false);
+        return doc;
     }
 
     // === 探索页面配置 ===
@@ -433,6 +621,7 @@ class MXS extends ComicSource {
             // 提取评论和推荐漫画
             const comments = this.parseCommentList(doc.querySelectorAll(".view-comment-main .postlist li.dashed"));
             const recommend = this.parseComicList(doc.querySelectorAll(".index-manga .mh-item"));
+            const isFavorite = doc.querySelector("#addfavor")?.attributes?.["data-val"] === "1";
 
             doc.dispose();
             
@@ -454,7 +643,8 @@ class MXS extends ComicSource {
                 commentCount: comments.length,
                 updateTime: updateTime,
                 url: url,
-                comments: comments
+                comments: comments,
+                isFavorite: isFavorite
             });
         },
 
