@@ -4,7 +4,7 @@ class ManHuaRen extends ComicSource {
 
     key = "manhuaren"
 
-    version = "1.0.0"
+    version = "1.0.1"
 
     minAppVersion = "1.6.0"
 
@@ -18,6 +18,171 @@ class ManHuaRen extends ComicSource {
     get baseUrl() {
         return "https://www.manhuaren.com";
     }
+
+    account = {
+        loginWithWebview: {
+            // 使用受保护的收藏页作为回跳目标，验证码由用户在网页中完成。
+            url: "https://www.manhuaren.com/login/?from=%2Fbookmarker%2F",
+            checkStatus: (url, title) => {
+                if (typeof url !== "string" || typeof title !== "string") return false;
+                const path = url.split(/[?#]/)[0];
+                return (path === this.baseUrl + "/bookmarker/" || path === this.baseUrl + "/bookmarker") &&
+                    title.trim() === "我的收藏_漫画人";
+            }
+        },
+        logout: () => {
+            Network.deleteCookies(this.baseUrl);
+            this.deleteData("_localStorage");
+            this.deleteData("account");
+        }
+    };
+
+    _accountBody(res) {
+        if (res.status === 401) throw "登录已过期，请重新网页登录";
+        const location = res.headers?.location || res.headers?.Location || "";
+        if (res.status >= 300 && res.status < 400 && /\/login(?:[/?#]|$)/i.test(location)) {
+            throw "登录已过期，请重新网页登录";
+        }
+        if (res.status !== 200) throw `账号请求失败，HTTP ${res.status}`;
+        if (typeof res.body !== "string" || !res.body.trim()) throw "账号响应为空，请检查登录状态或稍后重试";
+        if (/id\s*=\s*["']txt_password["']/i.test(res.body) || /<title>\s*用户登录/i.test(res.body)) {
+            throw "登录已过期，请重新网页登录";
+        }
+        if (/just a moment|checking your browser|cf-chl-|<title>[^<]*(?:验证|forbidden|access denied)/i.test(res.body)) {
+            throw "账号请求遇到反爬验证，请在网页中验证后重试";
+        }
+        return res.body;
+    }
+
+    async _accountPost(url, values, referer) {
+        const body = Object.keys(values).map(key => `${encodeURIComponent(key)}=${encodeURIComponent(values[key])}`).join("&");
+        const res = await Network.post(url, {
+            ...this._buildHeaders(),
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": this.baseUrl,
+            "Referer": referer
+        }, body, { maskDataInLog: true });
+        const text = this._accountBody(res);
+        let data;
+        try { data = JSON.parse(text); } catch (_) { throw "账号接口未返回有效 JSON，可能遇到验证或页面结构变化"; }
+        if (!data || typeof data !== "object" || Array.isArray(data)) throw "账号接口响应结构已变化";
+        if (String(data.Value) === "4") throw "登录已过期，请重新网页登录";
+        return data;
+    }
+
+    _favoriteComicUrl(id) {
+        if (typeof id !== "string") throw "收藏漫画地址无效";
+        let path = id.split(/[?#]/)[0];
+        if (path.startsWith(this.baseUrl + "/")) path = path.substring(this.baseUrl.length);
+        if (!path.startsWith("/")) path = "/" + path;
+        if (!/^\/manhua-[a-z0-9_%\-]+\/?$/i.test(path)) throw "收藏包含站外或无效漫画，请在网页书架中查看";
+        return this.baseUrl + path.replace(/\/?$/, "/");
+    }
+
+    _favoriteCover(value) {
+        if (typeof value !== "string" || !value.trim()) throw "收藏漫画封面缺失，页面结构可能已变化";
+        value = value.trim();
+        if (/^https?:\/\//i.test(value)) return value;
+        if (value.startsWith("//")) return "https:" + value;
+        if (value.startsWith("/") && !value.includes("\\")) return this.baseUrl + value;
+        throw "收藏漫画封面地址无效";
+    }
+
+    _favoriteContext(html, url) {
+        const uid = html.match(/\bvar\s+DM5_USERID\s*=\s*(\d+)\s*;/)?.[1];
+        if (uid === "0") throw "登录已过期，请重新网页登录";
+        if (!uid) throw "未找到账号信息，页面结构可能已变化";
+        const mid = html.match(/\bvar\s+DM5_MID\s*=\s*(\d+)\s*;/)?.[1];
+        if (!mid || mid === "0") throw "未找到收藏漫画 ID，页面结构可能已变化";
+        return { uid, mid, url };
+    }
+
+    async _favoriteState(context) {
+        // 官网批量查询返回明确的数字 ID 数组；单本也沿用末尾逗号的 mids 格式。
+        const data = await this._accountPost(`${context.url}userdata.ashx?d=${Date.now()}`,
+            { tp: 13, mids: context.mid + "," }, context.url);
+        if (!Array.isArray(data.comicids) || data.comicids.some(id => !Number.isInteger(id) || id <= 0)) {
+            throw "无法确认收藏状态，请检查登录状态或稍后重试";
+        }
+        return data.comicids.includes(Number(context.mid));
+    }
+
+    async _favoriteDocument() {
+        const html = this._accountBody(await Network.get(this.baseUrl + "/bookmarker/", this._buildHeaders()));
+        const doc = new HtmlDocument(html);
+        try {
+            const uid = html.match(/\bvar\s+DM5_USERID\s*=\s*(\d+)\s*;/)?.[1];
+            if (uid === "0") throw "登录已过期，请重新网页登录";
+            if (!uid || !doc.querySelector("#btnedit") || !doc.querySelector(".manga-list .manga-list-2")) {
+                throw "未找到收藏列表，可能遇到验证或页面结构已变化";
+            }
+            return doc;
+        } catch (error) {
+            doc.dispose();
+            throw error;
+        }
+    }
+
+    favorites = {
+        multiFolder: false,
+        loadComics: async (page) => {
+            if (!this.isLogged) throw "请先使用网页登录";
+            if (!Number.isInteger(page) || page < 1) throw "收藏页码无效";
+            // 分页接口的匿名空结果与空书架相同，先通过受保护页面确认会话。
+            const doc = await this._favoriteDocument();
+            try {
+                let comics;
+                let finished = false;
+                if (page === 1) {
+                    comics = doc.querySelectorAll(".manga-list .manga-list-2 > li").map(item => {
+                        const link = item.querySelector(".manga-list-2-title a");
+                        const title = link?.text?.trim();
+                        if (!title) throw "收藏漫画标题缺失，页面结构可能已变化";
+                        return new Comic({
+                            id: this._favoriteComicUrl(link.attributes.href), title,
+                            cover: this._favoriteCover(item.querySelector(".manga-list-2-cover-img")?.attributes?.src),
+                            subTitle: item.querySelector(".manga-list-2-tip")?.text?.trim()
+                        });
+                    });
+                } else {
+                    const data = await this._accountPost(`${this.baseUrl}/dm5.ashx?d=${Date.now()}`,
+                        { action: "getmorebookmarkers", pageindex: page, pagesize: 21, sort: 1 }, this.baseUrl + "/bookmarker/");
+                    if (data.items !== null && !Array.isArray(data.items)) throw "收藏分页响应结构已变化";
+                    if (data.items === null) {
+                        // 不把请求期间失效的会话误判为最后一页。
+                        const confirmation = await this._favoriteDocument();
+                        confirmation.dispose();
+                        finished = true;
+                    }
+                    comics = (data.items || []).map(item => {
+                        if (item.IsHaveOtherSource) throw "收藏包含站外漫画，请在网页书架中查看";
+                        if (typeof item.Title !== "string" || !item.Title.trim()) throw "收藏漫画标题缺失";
+                        return new Comic({
+                            id: this._favoriteComicUrl(item.UrlKey), title: item.Title.trim(),
+                            cover: this._favoriteCover(item.ShowPicUrlB),
+                            subTitle: item.ShowLastPartName || ""
+                        });
+                    });
+                }
+                // 官网仅在 items 为 null 时结束；空数组和首屏条数都不证明没有下一页。
+                return { comics, maxPage: finished ? page : page + 1 };
+            } finally { doc.dispose(); }
+        },
+        addOrDelFavorite: async (comicId, folderId, isAdding) => {
+            if (!this.isLogged) throw "请先使用网页登录";
+            if (typeof isAdding !== "boolean") throw "收藏操作无效";
+            const url = this._favoriteComicUrl(comicId);
+            const html = this._accountBody(await Network.get(url, this._buildHeaders()));
+            const context = this._favoriteContext(html, url);
+            if (await this._favoriteState(context) === isAdding) return true;
+            const values = { cid: 0, mid: context.mid, page: 1, uid: context.uid, language: 1 };
+            if (!isAdding) values.cancel = 1;
+            const data = await this._accountPost(`${url}bookmarker.ashx?d=${Date.now()}`, values, url);
+            if (String(data.Value) !== "1") throw isAdding ? "收藏失败，请稍后重试" : "取消收藏失败，请稍后重试";
+            return true;
+        }
+    };
 
     // helper to build common request headers
     _buildHeaders() {
@@ -658,6 +823,11 @@ class ManHuaRen extends ComicSource {
                 this.comic.mid = parseInt(midMatch[1]);
             }
 
+            let isFavorite;
+            if (this.isLogged) {
+                isFavorite = await this._favoriteState(this._favoriteContext(html, this._favoriteComicUrl(id)));
+            }
+
             return new ComicDetails({
                 title,
                 cover,
@@ -671,6 +841,7 @@ class ManHuaRen extends ComicSource {
                 recommend: recommends,
                 updateTime: updateTime,
                 stars: starValue,
+                isFavorite,
                 subId: this.comic.mid ? this.comic.mid.toString() : '73225'
             });
         },
