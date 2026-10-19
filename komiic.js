@@ -6,7 +6,7 @@ class Komiic extends ComicSource {
     // 唯一标识符
     key = "Komiic"
 
-    version = "1.0.3"
+    version = "1.0.4"
 
     minAppVersion = "1.0.0"
 
@@ -14,96 +14,117 @@ class Komiic extends ComicSource {
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/komiic.js"
 
     get headers() {
-        let token = this.loadData('token')
-        let headers = {
+        return {
             'Referer': 'https://komiic.com/',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Content-Type': 'application/json'
         }
-        if (token) {
-            headers['Authorization'] = `Bearer ${token}`
-        }
-        return headers
     }
 
-    async queryJson(query) {
+    async refreshSession() {
+        // Share a single refresh when parallel detail requests find an expired cookie.
+        if (!this._refreshRequest) {
+            this._refreshRequest = (async () => {
+                const res = await Network.post('https://komiic.com/auth/refresh', this.headers, {})
+                if (res.status !== 200) {
+                    throw new Error(`Authentication expired; please log in again (HTTP ${res.status})`)
+                }
+            })()
+        }
+        const pending = this._refreshRequest
+        try {
+            await pending
+        } finally {
+            if (this._refreshRequest === pending) this._refreshRequest = null
+        }
+    }
+
+    async queryJson(query, retryAuth = true) {
         let res = await Network.post(
             'https://komiic.com/api/query',
             this.headers,
             query
         )
 
+        if (res.status === 401 && retryAuth) {
+            await this.refreshSession()
+            return this.queryJson(query, false)
+        }
         if (res.status !== 200) {
-            throw `Invalid Status Code ${res.status}`
+            throw new Error(`Komiic HTTP ${res.status}`)
         }
-
-        let json = JSON.parse(res.body)
-
-        if (json.errors != undefined) {
-            const errorInfo = json.errors[0].message.toString();
-            if ((errorInfo.indexOf('token is expired') >= 0) || (errorInfo.indexOf('no token') >= 0)) {
-                const accountData = this.loadData("account");
-                await this.account.login(accountData[0], accountData[1]);
-                return await this.queryJson(query);
+        let json
+        try {
+            json = JSON.parse(res.body)
+        } catch (_) {
+            throw new Error('Komiic returned invalid JSON; check network or browser verification')
+        }
+        if (!json || typeof json !== 'object' || Array.isArray(json)) {
+            throw new Error('Invalid Komiic GraphQL response')
+        }
+        if (json.errors !== undefined && !Array.isArray(json.errors)) {
+            throw new Error('Invalid Komiic GraphQL errors')
+        }
+        if (json.errors && json.errors.length) {
+            const isAuthError = e => e && (
+                /token is expired|no token|token_expired|unauthenticated/i.test(String(e.message)) ||
+                (e.extensions && e.extensions.code === 'UNAUTHENTICATED')
+            )
+            if (retryAuth && json.errors.every(isAuthError)) {
+                await this.refreshSession()
+                return this.queryJson(query, false)
             }
-            throw json.errors[0].message
+            throw new Error(json.errors.map(e => e && e.message || 'Komiic GraphQL error').join('; '))
         }
-
+        if (!json.data || typeof json.data !== 'object' || Array.isArray(json.data)) {
+            throw new Error('Missing Komiic GraphQL data')
+        }
         return json
+    }
+
+    parseComic(comic) {
+        if (!comic || comic.id == null || !comic.title || !comic.imageUrl) {
+            throw new Error('Invalid Komiic comic data')
+        }
+        const authors = comic.authors == null ? [] : comic.authors
+        const categories = comic.categories == null ? [] : comic.categories
+        if (!Array.isArray(authors) || !Array.isArray(categories)) {
+            throw new Error('Invalid Komiic comic metadata')
+        }
+        const updateTime = comic.dateUpdated ? new Date(comic.dateUpdated) : null
+        const validDate = updateTime && Number.isFinite(updateTime.getTime())
+        let description = ''
+        if (validDate) {
+            const hours = Math.max(0, Math.floor((Date.now() - updateTime.getTime()) / 3600000))
+            description = hours < 1 ? '剛剛更新' : hours < 24 ? `${hours}小時前更新` : `${Math.floor(hours / 24)}天前更新`
+        }
+        return {
+            id: String(comic.id),
+            title: comic.title,
+            subTitle: authors.map(a => a.name).filter(Boolean).join(', '),
+            cover: comic.imageUrl,
+            tags: categories.map(c => c.name).filter(Boolean),
+            description,
+            updateTime: validDate ? `${updateTime.getFullYear()}-${updateTime.getMonth() + 1}-${updateTime.getDate()}` : undefined
+        }
     }
 
     async queryComics(query) {
         let operationName = query["operationName"]
         let json = await this.queryJson(query)
-
-        function parseComic(comic) {
-            let author = ''
-            if (comic.authors.length > 0) {
-                author = comic.authors[0].name
-            }
-            let tags = []
-            comic.categories.forEach((c) => {
-                tags.push(c.name)
-            })
-
-            function getTimeDifference(date) {
-                const now = new Date();
-                const timeDifference = now - date;
-
-                const millisecondsPerHour = 1000 * 60 * 60;
-                const millisecondsPerDay = millisecondsPerHour * 24;
-
-                if (timeDifference < millisecondsPerHour) {
-                    return '剛剛更新';
-                } else if (timeDifference < millisecondsPerDay) {
-                    const hours = Math.floor(timeDifference / millisecondsPerHour);
-                    return `${hours}小時前更新`;
-                } else {
-                    const days = Math.floor(timeDifference / millisecondsPerDay);
-                    return `${days}天前更新`;
-                }
-            }
-
-            let updateTime = new Date(comic.dateUpdated)
-            let description = getTimeDifference(updateTime)
-            let formatedTime = `${updateTime.getFullYear()}-${updateTime.getMonth() + 1}-${updateTime.getDate()}`
-
-            return {
-                id: comic.id,
-                title: comic.title,
-                subTitle: author,
-                cover: comic.imageUrl,
-                tags: tags,
-                description: description,
-                updateTime: formatedTime
-            }
+        if (!Array.isArray(json.data[operationName])) {
+            throw new Error(`Missing Komiic ${operationName} comic list`)
         }
-
+        // The API exposes offsets, not a total. Omit an unknown page count.
         return {
-            comics: json.data[operationName].map(parseComic),
-            // 没找到最大页数的接口
-            maxPage: null
+            comics: json.data[operationName].map(c => this.parseComic(c))
         }
+    }
+
+    parseSearchComics(json) {
+        const result = json.data.searchComicsAndAuthors
+        if (!result || !Array.isArray(result.comics)) throw new Error('Missing Komiic search comic list')
+        return result.comics.map(c => this.parseComic(c))
     }
 
     /// 账号
@@ -118,20 +139,45 @@ class Komiic extends ComicSource {
                 {
                     email: account,
                     password: pwd
-                }
+                },
+                { maskDataInLog: true }
             )
 
             if (res.status === 200) {
-                this.saveData('token', JSON.parse(res.body).token)
+                // Login now sets HttpOnly cookies; its body may be empty.
+                const json = await this.queryJson({
+                    operationName: 'accountQuery', variables: {},
+                    query: 'query accountQuery { account { id } }'
+                }, false)
+                if (!json.data.account || json.data.account.id == null || String(json.data.account.id) === '0' || String(json.data.account.id) === '') {
+                    throw new Error('Failed to login: authenticated account missing')
+                }
+                this.deleteData('token')
                 return 'ok'
             }
 
-            throw 'Failed to login'
+            throw new Error(`Failed to login (HTTP ${res.status})`)
         },
 
         // 退出登录时将会调用此函数
         logout: () => {
+            // Native Venera does not await logout. Clear local state immediately,
+            // and snapshot cookies so the asynchronous revocation cannot race cleanup.
+            const cookies = Network.getCookies('https://komiic.com/auth/logout')
+            const headers = {
+                ...this.headers,
+                cookie: cookies.map(c => `${c.name}=${c.value}`).join('; ')
+            }
+            Network.deleteCookies('https://komiic.com/')
             this.deleteData('token')
+            this.deleteData('account')
+            const pending = Network.post('https://komiic.com/auth/logout', headers, {}, {
+                maskDataInLog: true, maskHeadersInLog: ['cookie']
+            }).then(res => {
+                if (res.status !== 200) throw new Error(`Failed to logout (HTTP ${res.status})`)
+            })
+            pending.catch(() => console.error('Komiic server logout failed; the local session was cleared'))
+            return pending
         },
 
         registerWebsite: "https://komiic.com/register"
@@ -252,50 +298,9 @@ class Komiic extends ComicSource {
         load: async (keyword, options, page) => {
             let json = await this.queryJson({ "operationName": "searchComicAndAuthorQuery", "variables": { "keyword": keyword }, "query": "query searchComicAndAuthorQuery($keyword: String!) {\n  searchComicsAndAuthors(keyword: $keyword) {\n    comics {\n      id\n      title\n      status\n      year\n      imageUrl\n      authors {\n        id\n        name\n        __typename\n      }\n      categories {\n        id\n        name\n        __typename\n      }\n      dateUpdated\n      monthViews\n      views\n      favoriteCount\n      lastBookUpdate\n      lastChapterUpdate\n      __typename\n    }\n    authors {\n      id\n      name\n      chName\n      enName\n      wikiLink\n      comicCount\n      views\n      __typename\n    }\n    __typename\n  }\n}" })
 
-            function parseComic(comic) {
-                let author = ''
-                if (comic.authors.length > 0) {
-                    author = comic.authors[0].name
-                }
-                let tags = []
-                comic.categories.forEach((c) => {
-                    tags.push(c.name)
-                })
-
-                function getTimeDifference(date) {
-                    const now = new Date();
-                    const timeDifference = now - date;
-
-                    const millisecondsPerHour = 1000 * 60 * 60;
-                    const millisecondsPerDay = millisecondsPerHour * 24;
-
-                    if (timeDifference < millisecondsPerHour) {
-                        return '剛剛更新';
-                    } else if (timeDifference < millisecondsPerDay) {
-                        const hours = Math.floor(timeDifference / millisecondsPerHour);
-                        return `${hours}小時前更新`;
-                    } else {
-                        const days = Math.floor(timeDifference / millisecondsPerDay);
-                        return `${days}天前更新`;
-                    }
-                }
-
-                let updateTime = new Date(comic.dateUpdated)
-                let description = getTimeDifference(updateTime)
-
-                return {
-                    id: comic.id,
-                    title: comic.title,
-                    subTitle: author,
-                    cover: comic.imageUrl,
-                    tags: tags,
-                    description: description
-                }
-            }
-
             return {
-                comics: json.data.searchComicsAndAuthors.comics.map(parseComic),
-                // 没找到最大页数的接口
+                comics: this.parseSearchComics(json),
+                // 搜索接口一次返回全部匹配结果。
                 maxPage: 1
             }
         },
@@ -364,24 +369,31 @@ class Komiic extends ComicSource {
         // 加载漫画信息
         loadInfo: async (id) => {
             let json1 = await this.queryJson({ "operationName": "recommendComicById", "variables": { "comicId": id }, "query": "query recommendComicById($comicId: ID!) {\n  recommendComicById(comicId: $comicId)\n}" })
-            let recommend = json1.data.recommendComicById
-            recommend.push(id)
+            if (!Array.isArray(json1.data.recommendComicById)) throw new Error('Missing Komiic recommendations')
+            let recommend = Array.from(new Set(json1.data.recommendComicById.map(String)))
+            if (!recommend.includes(String(id))) recommend.push(String(id))
 
             let getFavoriteStatus = async () => {
-                let token = this.loadData('token')
-                if (!token) {
+                if (!this.isLogged && !this.loadData('account')) {
                     return false
                 }
                 let json = await this.queryJson({ "operationName": "comicInAccountFolders", "variables": { "comicId": id }, "query": "query comicInAccountFolders($comicId: ID!) {\n  comicInAccountFolders(comicId: $comicId)\n}" })
                 let folders = json.data.comicInAccountFolders
+                if (!Array.isArray(folders)) throw new Error('Missing Komiic favorite status')
                 return folders.length !== 0
             }
 
             let getChapter = async () => {
                 let json = await this.queryJson({ "operationName": "chapterByComicId", "variables": { "comicId": id }, "query": "query chapterByComicId($comicId: ID!) {\n  chaptersByComicId(comicId: $comicId) {\n    id\n    serial\n    type\n    dateCreated\n    dateUpdated\n    size\n    __typename\n  }\n}" })
                 let all = json.data.chaptersByComicId
+                if (!Array.isArray(all)) throw new Error('Missing Komiic chapters')
+                const ids = new Set()
                 let books = [], chapters = []
                 all.forEach((c) => {
+                    if (!c || c.id == null || String(c.id) === '' || ids.has(String(c.id))) {
+                        throw new Error('Invalid or duplicate Komiic chapter id')
+                    }
+                    ids.add(String(c.id))
                     if(c.type === 'book') {
                         books.push(c)
                     } else {
@@ -391,21 +403,27 @@ class Komiic extends ComicSource {
                 let res = new Map()
                 books.forEach((c) => {
                     let name = '卷' + c.serial
-                    res.set(c.id, name)
+                    res.set(String(c.id), name)
                 })
                 chapters.forEach((c) => {
-                    let name = c.serial
-                    res.set(c.id, name)
+                    let name = String(c.serial == null ? c.id : c.serial)
+                    res.set(String(c.id), name)
                 })
                 return res
             }
 
             let results = await Promise.all([
                 this.queryComics({ "operationName": "comicByIds", "variables": { "comicIds": recommend }, "query": "query comicByIds($comicIds: [ID]!) {\n  comicByIds(comicIds: $comicIds) {\n    id\n    title\n    status\n    year\n    imageUrl\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    dateUpdated\n    monthViews\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}" }),
-                getChapter.call()
+                getChapter.call(),
+                getFavoriteStatus()
             ])
 
-            let info = results[0].comics.pop()
+            let info = results[0].comics.find(c => c.id === String(id))
+            if (!info) throw new Error('Requested Komiic comic was not returned')
+            const recommendations = new Map()
+            results[0].comics.forEach(c => {
+                if (c.id !== String(id)) recommendations.set(c.id, c)
+            })
 
             return {
                 // string 标题
@@ -419,27 +437,56 @@ class Komiic extends ComicSource {
                 },
                 // map<string, string>?, key为章节id, value为章节名称
                 chapters: results[1],
-                recommend: results[0].comics,
+                recommend: Array.from(recommendations.values()),
+                isFavorite: results[2],
                 updateTime: info.updateTime,
             }
         },
         // 获取章节图片
         loadEp: async (comicId, epId) => {
             let json = await this.queryJson({ "operationName": "imagesByChapterId", "variables": { "chapterId": epId }, "query": "query imagesByChapterId($chapterId: ID!) {\n  imagesByChapterId(chapterId: $chapterId) {\n    id\n    kid\n    height\n    width\n    __typename\n  }\n}" })
+            const images = json.data.imagesByChapterId
+            if (!Array.isArray(images) || images.length === 0) throw new Error('Missing Komiic chapter images')
             return {
-                images: json.data.imagesByChapterId.map((i) => {
-                    return `https://komiic.com/api/image/${i.kid}`
+                images: images.map((i) => {
+                    if (!i || typeof i.kid !== 'string' || !i.kid) throw new Error('Invalid Komiic image kid')
+                    return `https://komiic.com/api/image/${encodeURIComponent(i.kid)}`
                 })
             }
         },
         // 可选, 调整图片加载的行为
-        onImageLoad: (url, comicId, epId) => {
-            return {
-                headers: {
-                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'referer': `https://komiic.com/comic/${comicId}/chapter/${epId}/images/all`
+        onImageLoad: async (url, comicId, epId) => {
+            const prefix = 'https://komiic.com/api/image/'
+            if (typeof url !== 'string' || !url.startsWith(prefix)) throw new Error('Invalid Komiic image URL')
+            const kid = decodeURIComponent(url.substring(prefix.length))
+            if (!kid || /[/?#]/.test(kid)) throw new Error('Invalid Komiic image kid')
+            const loadTicket = async (retry) => {
+                // Anonymous refreshImageTicket currently returns TICKET_NOT_FOUND.
+                // Re-read a ticket once, without mutating the account or hiding failure.
+                const operation = 'getImageTicket'
+                const json = await this.queryJson({
+                    operationName: operation,
+                    variables: { kid },
+                    query: `query ${operation}($kid: String!) { ${operation}(kid: $kid) { url ticket kid width height expiresAt } }`
+                })
+                const ticket = json.data[operation]
+                if (!ticket || ticket.kid !== kid || typeof ticket.url !== 'string' || !/^https?:\/\//.test(ticket.url) ||
+                    typeof ticket.ticket !== 'string' || !ticket.ticket || !Number.isFinite(Date.parse(ticket.expiresAt)) ||
+                    Date.parse(ticket.expiresAt) - Date.now() < 10000) {
+                    throw new Error('Invalid or expired Komiic image ticket')
                 }
+                const config = {
+                    url: ticket.url,
+                    headers: {
+                        'User-Agent': this.headers['User-Agent'],
+                        'Referer': `https://komiic.com/comic/${comicId}/chapter/${epId}/images/all`,
+                        'X-Image-Ticket': ticket.ticket
+                    }
+                }
+                if (!retry) config.onLoadFailed = () => loadTicket(true)
+                return config
             }
+            return loadTicket(false)
         },
         // 加载评论
         loadComments: async (comicId, subId, page, replyTo) => {
@@ -466,7 +513,7 @@ class Komiic extends ComicSource {
                         id: e.id,
                     }
                 }),
-                maxPage: null,
+                ...(replyTo ? { maxPage: 1 } : {}),
             }
         },
         // 发送评论, 返回任意值表示成功
