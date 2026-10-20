@@ -119,7 +119,7 @@ class Goda extends ComicSource {
   // 源唯一标识
   key = "goda"
 
-  version = "1.3.2"
+  version = "1.3.3"
 
   minAppVersion = "1.4.0"
 
@@ -224,6 +224,8 @@ class Goda extends ComicSource {
   async _accountRequest(method, endpoint, data) {
     const url = `https://${this.loadSetting("api")}/api/user/${endpoint}`;
     const headers = {
+      // Account endpoints require the same browser UA as public requests.
+      "User-Agent": this.headers["User-Agent"],
       "Accept": "application/json",
       "Authorization": this._sessionToken(),
       // Native Venera caches GETs for five seconds even with no-store responses.
