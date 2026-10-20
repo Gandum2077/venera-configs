@@ -2,7 +2,7 @@
 class Lanraragi extends ComicSource {
     name = "Lanraragi"
     key = "lanraragi"
-    version = "1.2.0"
+    version = "1.2.1"
     minAppVersion = "1.4.0"
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/lanraragi.js"
 
@@ -280,16 +280,23 @@ class Lanraragi extends ComicSource {
         load: async (keyword, options, page = 1) => {
             const base = (this.baseUrl || '').replace(/\/$/, '')
 
-            // Fetch all results once (start=-1), then page locally for consistent UX across servers
+            // Venera JSON-encodes defaults, while manually selected values are raw.
             const qp = []
             const add = (k, v) => qp.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
             const pick = (key, def) => {
                 let v = options && (options[key])
                 if (typeof v === 'string') {
-                    const idx = v.indexOf('-');
-                    if (idx > 0) v = v.slice(0, idx)
+                    v = v.trim()
+                    try {
+                        const decoded = JSON.parse(v)
+                        if (decoded === null || typeof decoded !== 'object') v = decoded
+                    } catch (_) {}
                 }
-                return (v === undefined || v === null || v === '') ? def : v
+                if (v === undefined || v === null) return def
+                v = String(v).trim()
+                if (!v) return def
+                const idx = v.indexOf('-')
+                return idx > 0 ? v.slice(0, idx) : v
             }
             const sortby = pick(0, 'title')
             const order = pick(1, 'asc')
