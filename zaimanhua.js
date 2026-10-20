@@ -2,7 +2,7 @@ class Zaimanhua extends ComicSource {
   // 基础信息
   name = "再漫画";
   key = "zaimanhua";
-  version = "1.0.2";
+  version = "1.0.3";
   minAppVersion = "1.0.0";
   url =
     "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/zaimanhua.js";
@@ -18,6 +18,29 @@ class Zaimanhua extends ComicSource {
   buildUrl(path) {
     this.signTask();
     return `https://v4api.zaimanhua.com/app/v1/${path}`;
+  }
+  // 详情和章节与官方手机网页使用同一入口。旧 v4 详情会将仍存在的作品报为不存在。
+  buildReaderUrl(path) {
+    return `https://m.zaimanhua.com/api/app/v1/${path}?_v=15`;
+  }
+
+  readData(res, requireSuccessCode = false) {
+    this.checkResponseStatus(res);
+    const response = JSON.parse(res.body);
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw new Error("接口返回格式错误");
+    }
+    if (requireSuccessCode && response.errno === undefined) {
+      throw new Error("接口缺少 errno");
+    }
+    if (response.errno !== undefined && response.errno !== 0) {
+      if (response.errno === 99) throw new Error("Login expired: 请重新登录");
+      throw new Error(response.errmsg || `接口错误: ${response.errno}`);
+    }
+    if (!requireSuccessCode && !Object.prototype.hasOwnProperty.call(response, "data")) {
+      throw new Error("接口缺少 data");
+    }
+    return response.data;
   }
   // 每日签到
   async signTask() {
@@ -52,14 +75,12 @@ class Zaimanhua extends ComicSource {
         const res = await Network.post(
           "https://account-api.zaimanhua.com/v1/login/passwd",
           { "Content-Type": "application/x-www-form-urlencoded;charset=utf-8" },
-          `username=${username}&passwd=${encryptedPwd}`
+          `username=${encodeURIComponent(username)}&passwd=${encryptedPwd}`
         );
 
-        const data = JSON.parse(res.body);
-        if (data.errno !== 0) throw new Error(data.errmsg);
-
-        this.saveData("token", data.data.user.token);
-        this.headers.authorization = `Bearer ${data.data.user.token}`;
+        const data = this.readData(res, true);
+        this.saveData("token", data.user.token);
+        this.headers.authorization = `Bearer ${data.user.token}`;
         return true;
       } catch (e) {
         UI.showMessage(`登录失败: ${e.message}`);
@@ -68,13 +89,14 @@ class Zaimanhua extends ComicSource {
     },
     logout: () => {
       this.deleteData("token");
+      this.headers.authorization = "Bearer ";
     },
   };
 
   // 状态检查
   checkResponseStatus(res) {
     if (res.status === 401) {
-      throw new Error("登录失效");
+      throw new Error("Login expired: 登录失效");
     }
     if (res.status !== 200) {
       throw new Error(`请求失败: ${res.status}`);
@@ -118,7 +140,7 @@ class Zaimanhua extends ComicSource {
           this.buildUrl(`comic/update/list/0/${page}`),
           this.headers
         );
-        const data = JSON.parse(res.body).data;
+        const data = this.readData(res);
         return {
           comics: data.map((item) => this.parseComic(item)),
         };
@@ -212,7 +234,7 @@ class Zaimanhua extends ComicSource {
           this.headers
         );
         return {
-          comics: JSON.parse(res.body).data.map((item) =>
+          comics: this.readData(res).map((item) =>
             this.parseComic(item)
           ),
           maxPage: 10,
@@ -225,7 +247,7 @@ class Zaimanhua extends ComicSource {
           ),
           this.headers
         );
-        const data = JSON.parse(res.body).data;
+        const data = this.readData(res);
         return {
           comics: data.comicList.map((item) => this.parseComic(item)),
           maxPage: Math.ceil(data.totalNum / 20),
@@ -286,7 +308,7 @@ class Zaimanhua extends ComicSource {
         ),
         this.headers
       );
-      const data = JSON.parse(res.body).data.list;
+      const data = this.readData(res).list;
       return {
         comics: data.map((item) => this.parseComic(item)),
       };
@@ -303,27 +325,19 @@ class Zaimanhua extends ComicSource {
         this.buildUrl(`comic/sub/${path}?comic_id=${comicId}`),
         this.headers
       );
-      const data = JSON.parse(res.body);
-      if (data.errno !== 0) {
-        throw new Error(data.errmsg || "操作失败");
-      }
+      this.readData(res, true);
       return "ok";
     },
     loadComics: async (page) => {
-      try {
-        const res = await Network.get(
-          this.buildUrl(`comic/sub/list?status=0&page=${page}&size=20`),
-          this.headers
-        );
-        const data = JSON.parse(res.body).data;
-        return {
-          comics: data.subList.map((item) => this.parseComic(item)) ?? [],
-          maxPage: Math.ceil(data.total / 20),
-        };
-      } catch (e) {
-        console.error("加载收藏失败:", e);
-        return { comics: [], maxPage: null };
-      }
+      const res = await Network.get(
+        this.buildUrl(`comic/sub/list?status=0&page=${page}&size=20`),
+        this.headers
+      );
+      const data = this.readData(res);
+      return {
+        comics: data.subList.map((item) => this.parseComic(item)),
+        maxPage: Math.ceil(data.total / 20),
+      };
     },
   };
 
@@ -341,19 +355,16 @@ class Zaimanhua extends ComicSource {
           this.buildUrl(`comic/sub/checkIsSub?objId=${id}&source=1`),
           this.headers
         );
-        this.checkResponseStatus(res);
-        return JSON.parse(res.body).data.isSub;
+        return this.readData(res).isSub;
       };
       let results = await Promise.all([
         Network.get(
-          this.buildUrl(`comic/detail/${id}?channel=android`),
-          this.headers
+          this.buildReaderUrl(`comic/detail/${id}`),
+          { ...this.headers, Platform: "h5" }
         ),
-        getFavoriteStatus.bind(this)(id),
+        this.isLogged ? getFavoriteStatus(id) : Promise.resolve(null),
       ]);
-      const response = JSON.parse(results[0].body);
-      if (response.errno !== 0) throw new Error(response.errmsg || "加载失败");
-      const data = response.data.data;
+      const data = this.readData(results[0]).data;
 
       function processChapters(groups) {
         return (groups || []).reduce((result, group) => {
@@ -391,90 +402,89 @@ class Zaimanhua extends ComicSource {
     },
     loadEp: async (comicId, epId) => {
       const res = await Network.get(
-        this.buildUrl(`comic/chapter/${comicId}/${epId}`),
-        this.headers
+        this.buildReaderUrl(`comic/chapter/${comicId}/${epId}`),
+        { ...this.headers, Platform: "h5" }
       );
-      const data = JSON.parse(res.body).data.data;
-      return { images: data.page_url_hd || data.page_url };
+      const data = this.readData(res).data;
+      const images = Array.isArray(data.page_url_hd) && data.page_url_hd.length
+        ? data.page_url_hd : data.page_url;
+      if (!Array.isArray(images) || !images.length) {
+        throw new Error(data.canRead === false
+          ? "服务端返回 canRead=false，该章节当前不可阅读" : "章节没有返回图片");
+      }
+      if (images.some((url) => typeof url !== "string" || !url)) {
+        throw new Error("章节图片地址格式错误");
+      }
+      return { images };
     },
     
     loadComments: async (comicId, subId, page, replyTo) => {
-      try {
-        // 构建请求URL
-        const url = this.buildUrl(
-          `comment/list?page=${page}&size=30&type=4&objId=${
-            subId || comicId
-          }&sortBy=1`
-        );
-        const res = await Network.get(url, this.headers);
-        this.checkResponseStatus(res);
+      // 构建请求URL
+      const url = this.buildUrl(
+        `comment/list?page=${page}&size=30&type=4&objId=${
+          subId || comicId
+        }&sortBy=1`
+      );
+      const res = await Network.get(url, this.headers);
+      const data = this.readData(res);
 
-        const response = JSON.parse(res.body);
-        const data = response.data;
-
-        /* 空数据检查 */
-        if (!data || !data.commentIdList || !data.commentList) {
-          UI.showMessage("暂时没有评论，快来发表第一条吧~");
-          return { comments: [], maxPage: 0 };
-        }
-
-        /* 处理评论ID列表 */
-        // 标准化ID数组：处理null/字符串/数组等多种情况
-        const rawIds = Array.isArray(data.commentIdList)
-          ? data.commentIdList
-          : [];
-
-        // 展开所有ID并过滤无效值
-        const allCommentIds = rawIds
-          .map((idStr) => `${idStr || ""}`.split(",")) // 转换为字符串再分割
-          .flat()
-          .filter((id) => id.trim() !== "");
-
-        // 最终ID处理流程
-        const processComments = () => {
-          // 去重并验证ID有效性
-          const validIds = [...new Set(allCommentIds)].filter((id) =>
-            data.commentList.hasOwnProperty(id)
-          );
-
-          // 过滤回复评论
-          const filteredIds = replyTo
-            ? validIds.filter(
-                (id) => data.commentList[id]?.to_comment_id == replyTo
-              )
-            : validIds;
-
-          // 转换为评论对象
-          return filteredIds.map((id) => {
-            const comment = data.commentList[id];
-            return new Comment({
-              userName: comment.nickname || "匿名用户",
-              avatar: comment.photo || "",
-              content: comment.content || "[内容已删除]",
-              time: this.formatTimestamp(comment.create_time),
-              replyCount: comment.reply_amount || 0,
-              score: comment.like_amount || 0,
-              id: String(id),
-              parentId: comment.to_comment_id || null,
-            });
-          });
-        };
-
-        // 当没有有效评论时显示提示
-        const comments = processComments();
-        if (comments.length === 0) {
-          UI.showMessage(replyTo ? "该评论暂无回复" : "这里还没有评论哦~");
-        }
-
-        return {
-          comments: comments,
-          maxPage: Math.ceil((data.total || 0) / 30),
-        };
-      } catch (e) {
-        console.error("评论加载失败:", e);
-        UI.showMessage(`加载评论失败: ${e.message}`);
-        return { comments: [], maxPage: 0 };
+      if (!data || !Array.isArray(data.commentIdList) ||
+          !data.commentList || typeof data.commentList !== "object") {
+        throw new Error("评论数据格式错误");
       }
+
+      /* 处理评论ID列表 */
+      // 标准化ID数组：处理null/字符串/数组等多种情况
+      const rawIds = Array.isArray(data.commentIdList)
+        ? data.commentIdList
+        : [];
+
+      // 展开所有ID并过滤无效值
+      const allCommentIds = rawIds
+        .map((idStr) => `${idStr || ""}`.split(",")) // 转换为字符串再分割
+        .flat()
+        .filter((id) => id.trim() !== "");
+
+      // 最终ID处理流程
+      const processComments = () => {
+        // 去重并验证ID有效性
+        const validIds = [...new Set(allCommentIds)].filter((id) =>
+          Object.prototype.hasOwnProperty.call(data.commentList, id)
+        );
+
+        // 过滤回复评论
+        const filteredIds = replyTo
+          ? validIds.filter(
+              (id) => data.commentList[id]?.to_comment_id == replyTo
+            )
+          : validIds;
+
+        // 转换为评论对象
+        return filteredIds.map((id) => {
+          const comment = data.commentList[id];
+          return new Comment({
+            userName: comment.nickname || "匿名用户",
+            avatar: comment.photo || "",
+            content: comment.content || "[内容已删除]",
+            time: this.formatTimestamp(comment.create_time),
+            replyCount: comment.reply_amount || 0,
+            score: comment.like_amount || 0,
+            id: String(id),
+            parentId: comment.to_comment_id || null,
+          });
+        });
+      };
+
+      // 当没有有效评论时显示提示
+      const comments = processComments();
+      if (comments.length === 0) {
+        UI.showMessage(replyTo ? "该评论暂无回复" : "这里还没有评论哦~");
+      }
+
+      return {
+        comments: comments,
+        maxPage: Math.ceil((data.total || 0) / 30),
+      };
     },
   
     // 发送评论, 返回任意值表示成功.
@@ -492,9 +502,7 @@ class Zaimanhua extends ComicSource {
           content
         )}&to_comment_id=${replyTo}&type=4`
       );
-      this.checkResponseStatus(res);
-      let response = JSON.parse(res.body);
-      if (response.errno !== 0) throw new Error(response.errmsg || "加载失败");
+      this.readData(res, true);
       return "ok";
     },
     // 点赞
@@ -507,7 +515,7 @@ class Zaimanhua extends ComicSource {
         },
         `commentId=${commentId}&type=4`
       );
-      this.checkResponseStatus(res);
+      this.readData(res, true);
       return "ok";
     },
   };
