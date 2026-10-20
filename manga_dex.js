@@ -8,7 +8,7 @@ class MangaDex extends ComicSource {
     // unique id of the source
     key = "manga_dex"
 
-    version = "1.2.0"
+    version = "1.3.0"
 
     minAppVersion = "1.6.0"
 
@@ -167,15 +167,220 @@ class MangaDex extends ComicSource {
         }
     }
 
-    // MangaDex forum comments use the web session for authentication.
+    authGeneration = 0
+
+    mdHeaders(token) {
+        let headers = {
+            'Accept': 'application/json',
+            'User-Agent': 'Venera-MangaDex/1.3.0 (https://github.com/venera-app/venera-configs)',
+        }
+        if (token) headers.Authorization = `Bearer ${token}`
+        return headers
+    }
+
+    async mdRequest(method, url, headers, body) {
+        try {
+            // Use sendRequest directly: older Venera get/delete wrappers do not
+            // forward extra correctly. Request redirect suppression on hosts
+            // that support it, and mask credentials in their network logs.
+            return await Network.sendRequest(method, url, headers, body, {
+                followRedirects: false,
+                maskHeadersInLog: ['Authorization', 'authorization'],
+                maskDataInLog: true,
+                maskResponseInLog: true,
+            })
+        } catch (_) {
+            throw new Error('MangaDex network request failed; check your connection and retry')
+        }
+    }
+
+    mdJson(response, label) {
+        if (response.status === 403) throw new Error('MangaDex access denied (HTTP 403); check account permissions or network verification')
+        if (response.status === 429) throw new Error('MangaDex rate limited (HTTP 429); retry later')
+        if (response.status !== 200) throw new Error(`${label} failed (HTTP ${response.status})`)
+        let data
+        try { data = JSON.parse(response.body) } catch (_) {
+            throw new Error(`${label} returned invalid JSON; check network verification`)
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(`${label} returned invalid data`)
+        return data
+    }
+
+    async mdToken(fields) {
+        let body = Object.keys(fields).map(key => `${encodeURIComponent(key)}=${encodeURIComponent(fields[key])}`).join('&')
+        let response = await this.mdRequest('POST',
+            'https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token',
+            Object.assign(this.mdHeaders(), {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                // Public Venera's default response logger predates response
+                // masking. Its dart:io transport does not log response bodies.
+                'http_client': 'dart:io',
+            }), body)
+        if (response.status === 400 || response.status === 401) {
+            let error
+            try { error = JSON.parse(response.body).error } catch (_) {}
+            // Only invalid_grant means the saved refresh session was revoked.
+            if (error === 'invalid_grant') throw new Error('Login expired: MangaDex credentials or refresh token were rejected')
+            throw new Error('MangaDex OAuth request rejected; check your approved personal client ID and secret')
+        }
+        let data = this.mdJson(response, 'MangaDex authentication')
+        if (typeof data.access_token !== 'string' || !data.access_token || /\s/.test(data.access_token) ||
+            (data.refresh_token !== undefined && (typeof data.refresh_token !== 'string' || !data.refresh_token || /\s/.test(data.refresh_token))) ||
+            (data.expires_in !== undefined && (!Number.isFinite(data.expires_in) || data.expires_in <= 0))) {
+            throw new Error('MangaDex returned invalid authentication tokens')
+        }
+        return data
+    }
+
+    mdSession(data, clientId, clientSecret, previousRefresh) {
+        let refreshToken = data.refresh_token || previousRefresh
+        if (!refreshToken) throw new Error('MangaDex did not return a refresh token')
+        return {
+            accessToken: data.access_token,
+            refreshToken,
+            expiresAt: Date.now() + (data.expires_in || 900) * 1000,
+            clientId, clientSecret,
+        }
+    }
+
+    async mdRefresh() {
+        if (!this.mdRefreshing) {
+            let session = this.loadData('mdSession')
+            if (!session?.refreshToken || !session.clientId || !session.clientSecret) {
+                throw new Error('Login expired: sign in with your MangaDex personal API client')
+            }
+            let generation = this.authGeneration
+            const pending = (async () => {
+                try {
+                    let data = await this.mdToken({
+                        grant_type: 'refresh_token', refresh_token: session.refreshToken,
+                        client_id: session.clientId, client_secret: session.clientSecret,
+                    })
+                    if (generation !== this.authGeneration) throw new Error('MangaDex login changed; retry after signing in')
+                    let next = this.mdSession(data, session.clientId, session.clientSecret, session.refreshToken)
+                    this.saveData('mdSession', next)
+                    return next
+                } catch (error) {
+                    if (generation === this.authGeneration && String(error.message).startsWith('Login expired:')) {
+                        this.deleteData('mdSession')
+                    }
+                    throw error
+                }
+            })()
+            this.mdRefreshing = pending
+        }
+        const pending = this.mdRefreshing
+        try { return await pending } finally {
+            if (this.mdRefreshing === pending) this.mdRefreshing = null
+        }
+    }
+
+    async mdAuthenticated(path, method = 'GET', allowNotFollowed = false) {
+        // Only fixed API-relative routes may receive the access token.
+        if (!/^\/(?:user\/me|user\/follows\/manga(?:[/?]|$)|manga\/[a-f0-9-]+\/follow$)/i.test(path)) {
+            throw new Error('Invalid MangaDex authenticated route')
+        }
+        let session = this.loadData('mdSession')
+        if (!session) throw new Error('Login expired: sign in with your MangaDex personal API client; forum login is separate')
+        if (!session.accessToken || !Number.isFinite(session.expiresAt) || session.expiresAt <= Date.now() + 30000) session = await this.mdRefresh()
+        const generation = this.authGeneration
+        let response = await this.mdRequest(method, `https://api.mangadex.org${path}`, this.mdHeaders(session.accessToken))
+        if (generation !== this.authGeneration) throw new Error('MangaDex login changed; retry after signing in')
+        if (response.status === 401) {
+            let current = this.loadData('mdSession')
+            session = current && current.accessToken !== session.accessToken ? current : await this.mdRefresh()
+            response = await this.mdRequest(method, `https://api.mangadex.org${path}`, this.mdHeaders(session.accessToken))
+            if (generation !== this.authGeneration) throw new Error('MangaDex login changed; retry after signing in')
+            if (response.status === 401) {
+                this.deleteData('mdSession')
+                throw new Error('Login expired: sign in to MangaDex again')
+            }
+        }
+        // Only this documented membership check treats 404 as not followed.
+        if (allowNotFollowed && response.status === 404) return false
+        let data = this.mdJson(response, 'MangaDex API')
+        if (data.result !== 'ok') throw new Error('MangaDex API did not confirm success')
+        return data
+    }
+
+    mdComicId(id) {
+        if (typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id)) {
+            throw new Error('Invalid MangaDex comic ID')
+        }
+        return id
+    }
+
+    async mdIsFavorite(id) {
+        return (await this.mdAuthenticated(`/user/follows/manga/${this.mdComicId(id)}`, 'GET', true)) !== false
+    }
+
+    // Four obscured input fields avoid storing the password in account data.
+    // This is OAuth form data, not HTTP cookies. Forum login remains separate.
     account = {
+        loginWithCookies: {
+            fields: ['MangaDex username', 'MangaDex password', 'Personal client ID', 'Personal client secret'],
+            validate: async (values) => {
+                const generation = ++this.authGeneration
+                this.mdRefreshing = null
+                try {
+                    if (!Array.isArray(values) || values.length !== 4 || values.some(v => typeof v !== 'string' || !v.trim())) {
+                        throw new Error('Enter your MangaDex username, password, personal client ID and secret')
+                    }
+                    let [username, password, clientId, clientSecret] = values
+                    clientId = clientId.trim()
+                    clientSecret = clientSecret.trim()
+                    let data = await this.mdToken({ grant_type: 'password', username: username.trim(), password,
+                        client_id: clientId, client_secret: clientSecret })
+                    let session = this.mdSession(data, clientId, clientSecret)
+                    let response = await this.mdRequest('GET', 'https://api.mangadex.org/user/me', this.mdHeaders(session.accessToken))
+                    let user = this.mdJson(response, 'MangaDex account verification')
+                    if (user.result !== 'ok' || user.data?.type !== 'user' || !user.data.id) throw new Error('MangaDex did not verify the account')
+                    if (generation !== this.authGeneration) throw new Error('MangaDex login changed; retry after signing in')
+                    this.saveData('mdSession', session)
+                    return true
+                } catch (error) {
+                    // Public Venera logs evaluated JS (including the input) if
+                    // validate rejects. Display only our fixed diagnostics.
+                    try { UI.showMessage(error.message) } catch (_) {}
+                    return false
+                }
+            },
+        },
         loginWithWebview: {
             url: "https://forums.mangadex.org/login/",
             checkStatus: (url, title) => {
                 return url.startsWith("https://forums.mangadex.org/") && !url.includes("/login")
             }
         },
-        logout: () => Network.deleteCookies("https://forums.mangadex.org/")
+        logout: () => {
+            this.authGeneration++
+            this.mdRefreshing = null
+            this.deleteData('mdSession')
+            this.deleteData('account')
+            Network.deleteCookies('https://forums.mangadex.org/')
+        },
+        registerWebsite: 'https://mangadex.org',
+    }
+
+    // MangaDex follows are one collection; MDLists are a separate feature.
+    favorites = {
+        multiFolder: false,
+        loadComics: async (page) => {
+            page = page || 1
+            if (!Number.isSafeInteger(page) || page < 1) throw new Error('Invalid favorites page')
+            let offset = (page - 1) * this.comicsPerPage
+            if (offset + this.comicsPerPage > 10000) throw new Error('MangaDex cannot paginate favorites beyond 10000 entries')
+            let data = await this.mdAuthenticated(`/user/follows/manga?limit=${this.comicsPerPage}&offset=${offset}&includes[]=cover_art&includes[]=author&includes[]=artist`)
+            if (!Array.isArray(data.data) || !Number.isSafeInteger(data.total) || data.total < 0) {
+                throw new Error('MangaDex returned an invalid favorites list')
+            }
+            return { comics: data.data.map(item => this.api.parseComic(item)), maxPage: Math.max(1, Math.ceil(data.total / this.comicsPerPage)) }
+        },
+        addOrDelFavorite: async (comicId, folderId, isAdding) => {
+            if (typeof isAdding !== 'boolean') throw new Error('Invalid MangaDex favorite operation')
+            await this.mdAuthenticated(`/manga/${this.mdComicId(comicId)}/follow`, isAdding ? 'POST' : 'DELETE')
+            return 'ok'
+        },
     }
 
     // explore page list
@@ -625,6 +830,7 @@ class MangaDex extends ComicSource {
 
             return new ComicDetails({
                 id: comic.id,
+                isFavorite: this.loadData('mdSession') ? await this.mdIsFavorite(id) : undefined,
                 title: comic.title,
                 subtitle: comic.subtitle,
                 cover: comic.cover,
