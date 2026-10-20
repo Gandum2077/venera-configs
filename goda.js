@@ -15,6 +15,9 @@ const DECODE_MARKER1 = "kD";
 const DECODE_MARKER2 = "W4s";
 const DECODE_SUFFIX = "nQ";
 const DECODE_GROUP = 7;
+// Native Venera reads login metadata before registering settings. Keep account
+// login on the official origin; browsing domains remain independently editable.
+const GODA_LOGIN_ORIGIN = "https://godamh.com";
 
 // 预计算的查找表：自定义字母表字符码 → 标准 base64url 字符码（-1 表示无效）
 const DECODE_TABLE = new Array(128).fill(-1);
@@ -116,7 +119,7 @@ class Goda extends ComicSource {
   // 源唯一标识
   key = "goda"
 
-  version = "1.2.1"
+  version = "1.3.2"
 
   minAppVersion = "1.4.0"
 
@@ -160,6 +163,193 @@ class Goda extends ComicSource {
     };
   }
 
+  _webLoginPending = false;
+
+  account = {
+    loginWithWebview: {
+      url: GODA_LOGIN_ORIGIN + "/login",
+      checkStatus: (url, title) => {
+        if (typeof url !== "string") return false;
+        const path = url.split(/[?#]/)[0];
+        if (path === GODA_LOGIN_ORIGIN + "/login" || path === GODA_LOGIN_ORIGIN + "/login/") {
+          // Venera merges imported cookies, so an old app session must not
+          // conceal a missing cookie from the new browser login.
+          if (!this._webLoginPending) {
+            Network.deleteCookies(GODA_LOGIN_ORIGIN);
+            this.deleteData("account");
+            this.deleteData("_localStorage");
+            this._webLoginPending = true;
+          }
+          return false;
+        }
+        if (typeof title !== "string") return false;
+        const home = (path === GODA_LOGIN_ORIGIN || path === GODA_LOGIN_ORIGIN + "/") && title.trim() === "首頁-G站漫畫";
+        const shelf = (path === GODA_LOGIN_ORIGIN + "/user/bookmark" || path === GODA_LOGIN_ORIGIN + "/user/bookmark/") && title.trim() === "我的書架-G站漫畫";
+        return home || shelf;
+      },
+      onLoginSuccess: () => {
+        // The native host imports cookies before this synchronous callback.
+        // The server, rather than a page title or cached local shelf, validates
+        // the session on every subsequent account operation.
+        try { this._sessionToken(); }
+        finally { this._webLoginPending = false; }
+      }
+    },
+    logout: () => {
+      Network.deleteCookies(GODA_LOGIN_ORIGIN);
+      if (this.baseUrl !== GODA_LOGIN_ORIGIN) Network.deleteCookies(this.baseUrl);
+      this.deleteData("account");
+      this.deleteData("_localStorage");
+      this._webLoginPending = false;
+    }
+  };
+
+  _publicGet(url) {
+    // Network.get in some Venera releases puts extra in the data argument.
+    // Use the five-argument request API so imported cookies stay masked.
+    return Network.sendRequest("GET", url, this.headers, null, {
+      maskHeadersInLog: ["Cookie", "cookie", "Authorization", "authorization"]
+    });
+  }
+
+  _sessionToken() {
+    const cookies = Network.getCookies(GODA_LOGIN_ORIGIN + "/");
+    const cookie = Array.isArray(cookies) && cookies.find(item => item.name === "jwt_token");
+    if (!cookie || typeof cookie.value !== "string" || !/^[A-Za-z0-9._~-]+$/.test(cookie.value)) {
+      throw "未取得登录会话，请在网页完成 Cloudflare 验证和登录";
+    }
+    return cookie.value;
+  }
+
+  async _accountRequest(method, endpoint, data) {
+    const url = `https://${this.loadSetting("api")}/api/user/${endpoint}`;
+    const headers = {
+      "Accept": "application/json",
+      "Authorization": this._sessionToken(),
+      // Native Venera caches GETs for five seconds even with no-store responses.
+      // Account reads must reach the server for current shelf and detail status.
+      "cache-time": "no",
+      "Origin": GODA_LOGIN_ORIGIN,
+      "Referer": GODA_LOGIN_ORIGIN + "/user/bookmark"
+    };
+    if (method === "POST") headers["Content-Type"] = "application/json";
+    const extra = {
+      followRedirects: false,
+      maskHeadersInLog: ["Authorization", "authorization", "Cookie", "cookie"],
+      maskDataInLog: true, maskResponseInLog: true, maskQueryInLog: true
+    };
+    let res;
+    try {
+      res = await Network.sendRequest(method, url, headers, method === "GET" ? null : JSON.stringify(data), extra);
+    } catch (error) {
+      // Preserve Venera's interactive Cloudflare handler without exposing a
+      // transport exception that may contain request headers or account data.
+      const message = String(error && error.message || error);
+      if (/CloudflareException/i.test(message)) throw "CloudflareException: " + url;
+      if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(message)) throw "Network request failed: DNS ENOTFOUND";
+      if (/CERT_|TLS|SSL/i.test(message)) throw "Network request failed: TLS error";
+      if (/timeout|timed out|AbortError/i.test(message)) throw "Network request timeout";
+      throw "Network request failed: 收藏接口连接失败，请稍后重试";
+    }
+    const text = typeof res.body === "string" ? res.body : "";
+    const challengeHeader = Object.keys(res.headers || {}).some(key => key.toLowerCase() === "cf-mitigated" && String(res.headers[key]).toLowerCase() === "challenge");
+    if (challengeHeader || /cf-chl-|challenge-platform|<title[^>]*>\s*(?:just a moment|checking your browser|attention required)/i.test(text)) {
+      throw "Cloudflare 验证未完成，请在网页登录验证后重试";
+    }
+    if (res.status === 401 || res.status === 403) {
+      if (res.status === 401) this.deleteData("account");
+      throw `登录会话失效或账号请求被拒绝，HTTP ${res.status}，请重新网页登录`;
+    }
+    if (res.status === 429) throw "收藏请求过于频繁，HTTP 429，请稍后重试";
+    if (res.status < 200 || res.status >= 300) throw `收藏请求失败，HTTP ${res.status}`;
+    let result;
+    try { result = JSON.parse(text); }
+    catch (_) { throw "收藏接口未返回有效 JSON，可能遇到登录验证或页面结构变化"; }
+    if (method === "POST") {
+      if (!result || typeof result !== "object" || Array.isArray(result) || result.status !== 200 || result.message !== "success") {
+        throw "收藏接口未确认操作成功，请刷新后重试";
+      }
+      return result;
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result) || !Array.isArray(result.bookmarks)) {
+      throw "收藏接口响应结构已变化，未取得完整账号书架";
+    }
+    return result;
+  }
+
+  _mangaId(value) {
+    if ((typeof value !== "number" && typeof value !== "string") || !/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+      throw "收藏漫画 ID 无效";
+    }
+    return Number(value);
+  }
+
+  _favoritePath(id) {
+    if (typeof id !== "string") throw "收藏漫画地址无效";
+    let path = id.split(/[?#]/)[0];
+    if (path.startsWith(this.baseUrl + "/")) path = path.substring(this.baseUrl.length);
+    if (!/^\/manga\/[^/?#\\\s]+\/?$/.test(path) || /%(?:2f|5c)/i.test(path) || /\/\.{1,2}\/?$/.test(path)) {
+      throw "收藏漫画地址无效";
+    }
+    return path.replace(/\/$/, "");
+  }
+
+  async _readBookmarks() {
+    const result = await this._accountRequest("GET", "me");
+    const ids = new Set(), paths = new Set();
+    return result.bookmarks.map(item => {
+      if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.slug !== "string" || /[/?#\\\s]/.test(item.slug)) {
+        throw "收藏条目结构已变化，无法读取完整书架";
+      }
+      const id = this._mangaId(item.id);
+      const path = this._favoritePath("/manga/" + item.slug);
+      let cover = item.cover;
+      if (typeof cover === "string" && cover.startsWith("//")) cover = "https:" + cover;
+      if (typeof cover !== "string" || !/^https?:\/\/[^/\s]+\//i.test(cover) || typeof item.title !== "string" || !item.title.trim()) {
+        throw "收藏条目缺少标题或封面，无法读取完整书架";
+      }
+      if (ids.has(id) || paths.has(path)) throw "收藏接口返回重复漫画，无法确认完整书架";
+      ids.add(id); paths.add(path);
+      return { id, path, title: item.title.trim(), cover };
+    });
+  }
+
+  favorites = {
+    multiFolder: false,
+    loadComics: async (page) => {
+      if (!Number.isInteger(page) || page < 1) throw "收藏页码无效";
+      const bookmarks = await this._readBookmarks();
+      return {
+        comics: page === 1 ? bookmarks.map(item => new Comic({ id: item.path, title: item.title, cover: item.cover })) : [],
+        maxPage: 1
+      };
+    },
+    addOrDelFavorite: async (comicId, folderId, isAdding) => {
+      if (typeof isAdding !== "boolean") throw "收藏操作参数无效";
+      const path = this._favoritePath(comicId);
+      // Resolve the requested comic independently; never reuse the last opened
+      // detail page's numeric ID when editing another comic from the shelf.
+      this._sessionToken();
+      const res = await this._publicGet(this.baseUrl + path);
+      const challengeHeader = Object.keys(res.headers || {}).some(key => key.toLowerCase() === "cf-mitigated" && String(res.headers[key]).toLowerCase() === "challenge");
+      if (challengeHeader) throw "Cloudflare 验证未完成，请在网页登录验证后重试";
+      if (res.status !== 200) throw `获取收藏漫画失败，HTTP ${res.status}`;
+      if (typeof res.body !== "string" || /<title[^>]*>\s*(?:just a moment|checking your browser|attention required)/i.test(res.body)) {
+        throw "Cloudflare 验证未完成，请在网页登录验证后重试";
+      }
+      const doc = new HtmlDocument(res.body);
+      const manga = doc.querySelector("#mangachapters");
+      // Normal comic pages also contain Cloudflare's background jsd script.
+      // Its presence alone is not an interstitial blocking the comic details.
+      if (!manga && /cf-chl-|challenge-platform/i.test(res.body)) throw "Cloudflare 验证未完成，请在网页登录验证后重试";
+      const id = this._mangaId(manga && manga.attributes["data-mid"]);
+      const before = await this._readBookmarks();
+      if (before.some(item => item.id === id) === isAdding) return true;
+      await this._accountRequest("POST", "bookmark", { mids: [id], action: isAdding ? "add" : "remove" });
+      return true;
+    }
+  };
+
   parseComics(doc) {
     const result = [];
     for (let item of doc.querySelectorAll(".pb-2")) {
@@ -188,7 +378,7 @@ class Goda extends ComicSource {
       type: "multiPartPage",
 
       load: async () => {
-        const res = await Network.get(this.baseUrl, this.headers);
+        const res = await this._publicGet(this.baseUrl);
         const document = new HtmlDocument(res.body);
         const result = [{ title: "近期更新", comics: [], viewMore: null }];
         for (let item of document.querySelector(".pb-unit-md").querySelectorAll(".slicarda")) {
@@ -323,7 +513,7 @@ class Goda extends ComicSource {
   /// 分类漫画加载
   categoryComics = {
     load: async (category, params, options, page) => {
-      const res = await Network.get(`${this.baseUrl}${params}/page/${page}`, this.headers);
+      const res = await this._publicGet(`${this.baseUrl}${params}/page/${page}`);
       if (res.status !== 200) {
         throw `Invalid status code: ${res.status}`;
       }
@@ -344,7 +534,7 @@ class Goda extends ComicSource {
   /// 搜索相关
   search = {
     load: async (keyword, options, page) => {
-      const res = await Network.get(`${this.baseUrl}/s/${keyword}?page=${page}`, this.headers);
+      const res = await this._publicGet(`${this.baseUrl}/s/${keyword}?page=${page}`);
       if (res.status !== 200) {
         throw `Invalid status code: ${res.status}`;
       }
@@ -372,7 +562,7 @@ class Goda extends ComicSource {
       }
     },
     loadInfo: async (id) => {
-      const res = await Network.get(this.baseUrl + id, this.headers);
+      const res = await this._publicGet(this.baseUrl + id);
       if (res.status !== 200) {
         throw `Invalid status code: ${res.status}`;
       }
@@ -423,7 +613,7 @@ class Goda extends ComicSource {
       }
 
       const chapters = {};
-      const jsonRes = await Network.get(`${this.apiUrl}/manga/get?mid=${mangaId}&mode=all&t=${Date.now()}`, this.headers);
+      const jsonRes = await this._publicGet(`${this.apiUrl}/manga/get?mid=${mangaId}&mode=all&t=${Date.now()}`);
       if (jsonRes.status !== 200) {
         throw `Invalid status code: ${jsonRes.status}`;
       }
@@ -460,6 +650,7 @@ class Goda extends ComicSource {
         tags: tags,
         chapters: chapters,
         recommend: recommend,
+        isFavorite: this.isLogged ? (await this._readBookmarks()).some(item => item.id === this._mangaId(mangaId)) : undefined,
       });
     },
 
@@ -468,7 +659,7 @@ class Goda extends ComicSource {
         throw "无效的章节ID";
       }
       const ids = epId.split("@");
-      const res = await Network.get(`${this.apiUrl}/chapter/getinfo?m=${ids[0]}&c=${ids[1]}`, this.headers);
+      const res = await this._publicGet(`${this.apiUrl}/chapter/getinfo?m=${ids[0]}&c=${ids[1]}`);
       if (res.status !== 200) {
         throw `Invalid status code: ${res.status}`;
       }
