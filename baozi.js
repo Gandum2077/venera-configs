@@ -5,7 +5,7 @@ class Baozi extends ComicSource {
   // 唯一标识符
   key = "baozi";
 
-  version = "1.1.8";
+  version = "1.1.9";
 
   minAppVersion = "1.0.0";
 
@@ -114,6 +114,8 @@ class Baozi extends ComicSource {
   /// 账号
   /// 设置为null禁用账号功能
   account = {
+    // 网站已停用直接账号密码登录，仅保留网页登录。
+    /*
     /// 登录
     /// 返回任意值表示登录成功
     login: async (account, pwd) => {
@@ -149,6 +151,8 @@ class Baozi extends ComicSource {
       }
       return "ok";
     },
+
+    */
 
     // 退出登录时将会调用此函数
     logout: () => {
