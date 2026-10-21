@@ -7,7 +7,7 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.0.5"
+    version = "1.0.9"
 
     minAppVersion = "1.0.0"
 
@@ -15,6 +15,22 @@ class Wnacg extends ComicSource {
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/wnacg.js"
 
     static domains = [];
+
+    get domains() {
+        let saved = this.loadData('domains')
+        let domains = Array.isArray(saved) ? saved : Wnacg.domains
+        return domains.filter(domain => !this.isPublicationDomain(domain))
+    }
+
+    isPublicationDomain(domain) {
+        return /^(?:www\.)?wn(?:acg)?\d+\.link$/i.test(domain)
+    }
+
+    contentDomain(domain) {
+        domain = domain.trim()
+        // This site's bare host redirects POSTs to www. Use one cookie origin.
+        return domain.toLowerCase() === 'wn003.cfd' ? 'www.wn003.cfd' : domain
+    }
 
     get baseUrl() {
         let selection = this.loadSetting('domainSelection')
@@ -27,19 +43,23 @@ class Wnacg extends ComicSource {
             if (!domain0 || domain0.trim() === '') {
                 throw 'Custom domain is not set'
             }
-            return `https://${domain0.trim()}`
+            return `https://${this.contentDomain(domain0)}`
         } else {
             // 选择获取的域名 (Domain 1-3)
             let index = selection - 1
-            if (index >= Wnacg.domains.length) {
-                throw 'Selected domain is unavailable'
-            }
-            return `https://${Wnacg.domains[index]}`
+            let domain = this.domains[index]
+            // Old selections may outlive the fetched list. Keep the custom URL usable.
+            if (!domain) domain = this.loadSetting('domain0')
+            if (!domain || !domain.trim()) throw 'Selected domain is unavailable'
+            return `https://${this.contentDomain(domain)}`
         }
     }
 
     overwriteDomains(domains) {
-        if (domains.length != 0) Wnacg.domains = domains
+        if (domains.length != 0) {
+            Wnacg.domains = domains.slice(0, 3)
+            this.saveData('domains', Wnacg.domains)
+        }
     }
 
     // [Optional] account related
@@ -54,18 +74,37 @@ class Wnacg extends ComicSource {
             let res = await Network.post(
                 `${this.baseUrl}/users-check_login.html`,
                 {
-                    'content-type': 'application/x-www-form-urlencoded'
+                    'content-type': 'application/x-www-form-urlencoded',
+                    'Origin': this.baseUrl,
+                    'Referer': `${this.baseUrl}/users-login.html?ajax=true`,
+                    'X-Requested-With': 'XMLHttpRequest',
                 },
-                `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(pwd)}`
+                `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(pwd)}`,
+                { maskDataInLog: true, maskResponseInLog: true, maskHeadersInLog: ['Cookie', 'cookie'] }
             )
+            this.checkChallenge('', res.headers)
             if (res.status !== 200) {
-                throw 'Login failed'
+                throw `Login failed: Invalid Status Code ${res.status}`
             }
-            let json = JSON.parse(res.body)
-            if (json['html'].includes('登錄成功')) {
+            let body = this.responseText(res.body)
+            this.checkChallenge(body)
+            let json
+            try { json = JSON.parse(body) }
+            catch (e) { throw 'Login failed: invalid JSON response' }
+            if (!json || typeof json !== 'object' || !Object.prototype.hasOwnProperty.call(json, 'ret')) {
+                throw 'Login failed: response is missing ret'
+            }
+            // Match the site's AJAX protocol, independently of its UI wording.
+            if (json.ret === true || json.ret === 1 || json.ret === '1') {
                 return 'ok'
             }
-            throw 'Login failed'
+            let message = typeof json.html === 'string' ? json.html : ''
+            message = message.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<[^>]*>/g, ' ')
+            for (let value of [account, pwd]) {
+                if (value) message = message.replaceAll(value, '[redacted]')
+            }
+            message = message.replace(/\s+/g, ' ').trim().slice(0, 180)
+            throw `Login failed${message ? ': ' + message : ': credentials rejected'}`
         },
 
         /**
@@ -80,7 +119,11 @@ class Wnacg extends ComicSource {
     }
 
     async init() {
-        if (this.loadSetting('refreshDomainsOnStart')) await this.refreshDomains(false)
+        let selection = Number(this.loadSetting('domainSelection') || 0)
+        // A custom domain must not depend on the address publication site.
+        if (selection >= 1 && selection <= 3 && this.loadSetting('refreshDomainsOnStart')) {
+            await this.refreshDomains(false)
+        }
     }
 
     /**
@@ -92,11 +135,14 @@ class Wnacg extends ComicSource {
         let title = ""
         let message = ""
         let domains = []
+        let failure = 'No domain links found'
 
         try {
-            let res = await fetch(url)
+            let res = await Network.get(url, { 'cache-time': 'no' })
+            this.checkChallenge('', res.headers)
             if (res.status == 200) {
-                let html = await res.text()
+                let html = this.responseText(res.body)
+                this.checkChallenge(html)
                 let document = new HtmlDocument(html)
                 // 提取所有链接
                 let links = document.querySelectorAll("a[href]")
@@ -114,6 +160,7 @@ class Wnacg extends ComicSource {
                         if (domain &&
                             domain.includes(".") &&
                             !domain.includes("wn01.link") &&
+                            !this.isPublicationDomain(domain) &&
                             !domain.includes("google.cn") &&
                             !domain.includes("cdn-cgi") &&
                             !seenDomains.has(domain)) {
@@ -128,15 +175,17 @@ class Wnacg extends ComicSource {
                     title = "Update Success"
                     message = "Fetched: \n\n"
                 }
-            }
+            } else failure = `Invalid Status Code ${res.status}`
         } catch (e) {
-            // 获取失败，使用自定义域名
+            if (!showConfirmDialog) throw e
+            failure = String(e)
         }
 
         if (domains.length == 0) {
+            if (!showConfirmDialog) throw `Failed to refresh domain list: ${failure}`
             title = "Update Failed"
-            message = "Using Custom: \n\n"
-            domains = Wnacg.domains
+            message = `Could not fetch domains: ${failure}\nKeeping the saved list.\n\n`
+            domains = this.domains
         }
 
         for (let i = 0; i < domains.length; i++) {
@@ -164,12 +213,93 @@ class Wnacg extends ComicSource {
         }
     }
 
+    absoluteUrl(value) {
+        value = String(value || '').trim()
+        if (/^https?:\/\//i.test(value)) return value
+        // The site's detail cover currently starts with four slashes.
+        if (/^\/{2,}/.test(value)) return 'https://' + value.replace(/^\/+/, '')
+        if (!value || /^[a-z][a-z0-9+.-]*:/i.test(value)) throw 'Invalid image or link URL'
+        return this.baseUrl + (value.startsWith('/') ? '' : '/') + value
+    }
+
+    responseText(body) {
+        if (typeof body === 'string') return body
+        if (body === undefined || body === null) throw 'Invalid empty response body'
+        // Native Venera can return bytes from its shared GET cache even for get().
+        return Convert.decodeUtf8(body)
+    }
+
+    checkChallenge(body, headers = {}) {
+        let challenged = Object.entries(headers || {}).some(([name, value]) =>
+            name.toLowerCase() === 'cf-mitigated' && String(value).toLowerCase().includes('challenge'))
+        if (challenged || /cf-chl-|challenge-platform|<title>\s*Just a moment/i.test(body)) {
+            throw 'Cloudflare challenge: open the site in a browser'
+        }
+    }
+
+    async getPage(url, headers = {}) {
+        let res = await Network.get(url, headers)
+        this.checkChallenge('', res.headers)
+        if (res.status !== 200) throw `Invalid Status Code ${res.status}`
+        let body = this.responseText(res.body)
+        this.checkChallenge(body)
+        return body
+    }
+
+    maxPage(document, current = 1) {
+        let pages = current
+        for (let e of document.querySelectorAll('div.f_left.paginator a, div.f_left.paginator span.thispage')) {
+            let text = e.text.trim()
+            if (/^\d+$/.test(text)) pages = Math.max(pages, Number(text))
+            let match = (e.attributes.href || '').match(/(?:-page-|[?&]p=)(\d+)/)
+            if (match) pages = Math.max(pages, Number(match[1]))
+        }
+        return pages
+    }
+
+    chapterLinks(document) {
+        let chapters = new Map()
+        for (let e of document.querySelectorAll('a.tagshow')) {
+            let match = (e.attributes.href || '').match(/-aid-(\d+)/)
+            let id = e.attributes['data-chid'] || (match && match[1])
+            if (id && /^\d+$/.test(id) && e.text.trim()) chapters.set(String(id), e.text.trim())
+        }
+        return chapters
+    }
+
+    checkFavoriteSession(document) {
+        if (document.querySelector('form#login_form, input[name="login_name"]')) throw 'Login expired'
+    }
+
+    favoriteFolders(document) {
+        this.checkFavoriteSession(document)
+        let folders = {}
+        for (let e of document.querySelectorAll('a[href]')) {
+            let match = (e.attributes.href || '').trim().match(/\/users-users_fav-c-(\d+)\.html$/)
+            if (match && e.text.trim() && folders[match[1]] === undefined) folders[match[1]] = e.text.trim()
+        }
+        if (!Object.keys(folders).length && !document.querySelector('a[href*="favclass"]')) {
+            throw 'Invalid favorites folder page'
+        }
+        return folders
+    }
+
+    async findFavorite(comicId, folderId) {
+        let page = 1, maxPage = 1
+        do {
+            let result = await this.favorites.loadComics(page, folderId)
+            let found = result.comics.find(comic => comic.id === String(comicId))
+            if (found) return found
+            maxPage = result.maxPage
+            page++
+        } while (page <= maxPage)
+        return null
+    }
+
     parseComic(c) {
         let link = c.querySelector("div.pic_box > a").attributes["href"];
         let id = RegExp("(?<=-aid-)[0-9]+").exec(link)[0];
-        let image =
-            c.querySelector("div.pic_box > a > img").attributes["src"];
-        image = `https:${image}`;
+        let image = this.absoluteUrl(c.querySelector("div.pic_box > a > img").attributes["src"]);
         let name = c.querySelector("div.info > div.title > a").text;
         let info = c.querySelector("div.info > div.info_col").text.trim();
         info = info.replaceAll('\n', '');
@@ -201,14 +331,10 @@ class Wnacg extends ComicSource {
              * - for `mixed` type, use param `page` as index. for each index(0-based), return {data: [], maxPage: number?}, data is an array contains Comic[] or {title: string, comics: Comic[], viewMore: string?}
              */
             load: async (page) => {
-                let res = await Network.get(this.baseUrl, {})
-                if (res.status !== 200) {
-                    throw `Invalid Status Code ${res.status}`
-                }
-                let document = new HtmlDocument(res.body)
+                let document = new HtmlDocument(await this.getPage(this.baseUrl))
                 let titleBlocks = document.querySelectorAll("div.title_sort");
                 let comicBlocks = document.querySelectorAll("div.bodywrap");
-                if (titleBlocks.length !== comicBlocks.length) {
+                if (!titleBlocks.length || titleBlocks.length !== comicBlocks.length) {
                     throw "Invalid Page"
                 }
                 let result = []
@@ -396,29 +522,25 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{comics: Comic[], maxPage: number}>}
          */
         load: async (category, param, options, page) => {
-            let url = this.baseUrl + param
+            let path = param
             if (page !== 0) {
-                if (!url.includes("-")) {
-                    url = url.replaceAll(".html", "-.html");
+                if (!path.includes("-")) {
+                    path = path.replaceAll(".html", "-.html");
                 }
-                url = url.replaceAll("index", "");
-                let lr = url.split("albums-");
+                path = path.replaceAll("index", "");
+                let lr = path.split("albums-");
                 lr[1] = `index-page-${page}${lr[1]}`;
-                url = `${lr[0]}albums-${lr[1]}`;
+                path = `${lr[0]}albums-${lr[1]}`;
             }
 
-            let res = await Network.get(url, {})
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
-            }
-            let document = new HtmlDocument(res.body)
+            let url = this.baseUrl + path
+            let document = new HtmlDocument(await this.getPage(url))
             let comicElements = document.querySelectorAll("div.grid div.gallary_wrap > ul.cc > li")
             let comics = []
             for (let comicElement of comicElements) {
                 comics.push(this.parseComic(comicElement))
             }
-            let pagesLink = document.querySelectorAll("div.f_left.paginator > a");
-            let pages = Number(pagesLink[pagesLink.length - 1].text)
+            let pages = this.maxPage(document, Math.max(page, 1))
             document.dispose()
             return {
                 comics: comics,
@@ -437,23 +559,14 @@ class Wnacg extends ComicSource {
                     url = `${this.baseUrl}/albums-favorite_ranking-page-${page}-type-${option}.html`
                 }
 
-                let res = await Network.get(url, {})
-                if (res.status !== 200) {
-                    throw `Invalid Status Code ${res.status}`
-                }
-
-                let document = new HtmlDocument(res.body)
+                let document = new HtmlDocument(await this.getPage(url))
                 let comicElements = document.querySelectorAll("div.grid div.gallary_wrap > ul.cc > li")
                 let comics = []
                 for (let comicElement of comicElements) {
                     comics.push(this.parseComic(comicElement))
                 }
 
-                let pagesLink = document.querySelectorAll("div.f_left.paginator > a")
-                let pages = 1
-                if (pagesLink.length > 0) {
-                    pages = Number(pagesLink[pagesLink.length - 1].text)
-                }
+                let pages = this.maxPage(document, Math.max(page, 1))
 
                 document.dispose()
                 return {
@@ -478,17 +591,16 @@ class Wnacg extends ComicSource {
             if (page !== 0) {
                 url += `&p=${page}`
             }
-            let res = await Network.get(url, {})
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
-            }
-            let document = new HtmlDocument(res.body)
+            let document = new HtmlDocument(await this.getPage(url))
             let comicElements = document.querySelectorAll("div.grid div.gallary_wrap > ul.cc > li")
             let comics = []
             for (let comicElement of comicElements) {
                 comics.push(this.parseComic(comicElement))
             }
-            let total = document.querySelectorAll("p.result > b")[0].text.replaceAll(',', '')
+            let count = document.querySelector("p.result > b")
+            if (!count) { document.dispose(); throw 'Invalid search page' }
+            let total = count.text.replaceAll(',', '').trim()
+            if (!/^\d+$/.test(total)) { document.dispose(); throw 'Invalid search count' }
             const comicsPerPage = 24
             let pages = Math.ceil(Number(total) / comicsPerPage)
             document.dispose()
@@ -503,6 +615,7 @@ class Wnacg extends ComicSource {
     favorites = {
         // whether support multi folders
         multiFolder: true,
+        singleFolderForSingleComic: true,
         isOldToNewSort: true,
         /**
          * add or delete favorite.
@@ -515,7 +628,12 @@ class Wnacg extends ComicSource {
          */
         addOrDelFavorite: async (comicId, folderId, isAdding, favoriteId) => {
             if (!isAdding) {
-                let res = await Network.get(`${this.baseUrl}/users-fav_del-id-${favoriteId}.html?ajax=true&_t=${randomDouble(0, 1)}`, {})
+                if (!favoriteId) {
+                    let found = await this.findFavorite(comicId, folderId)
+                    if (!found) return 'ok'
+                    favoriteId = found.favoriteId
+                }
+                let res = await Network.get(`${this.baseUrl}/users-fav_del-id-${favoriteId}.html?ajax=true&_t=${randomDouble(0, 1)}`, { 'cache-time': 'no' })
                 if (res.status !== 200) {
                     throw 'Delete failed'
                 }
@@ -537,20 +655,25 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{folders: {[p: string]: string}, favorited: string[]}>} - `folders` is a map of folder id to folder name, `favorited` is a list of folder id which contains the comic
          */
         loadFolders: async (comicId) => {
-            let res = await Network.get(`${this.baseUrl}/users-addfav-id-210814.html`, {})
-            if (res.status !== 200) {
-                throw 'Load failed'
+            let document = new HtmlDocument(await this.getPage(`${this.baseUrl}/users-users_fav.html`, { 'cache-time': 'no' }))
+            let folders
+            try { folders = this.favoriteFolders(document) }
+            finally { document.dispose() }
+            if (comicId === undefined || comicId === null || comicId === '') return { folders: folders, favorited: [] }
+
+            let popup = new HtmlDocument(await this.getPage(`${this.baseUrl}/users-addfav-id-${comicId}.html`, { 'cache-time': 'no' }))
+            try {
+                this.checkFavoriteSession(popup)
+                if (popup.querySelector('form select[name="favc_id"]')) return { folders: folders, favorited: [] }
+                let notice = popup.querySelector('div.box_container')
+                if (!notice || !/已[經经]收藏/.test(notice.text)) throw 'Invalid favorite status response'
+            } finally { popup.dispose() }
+            // The already-favorited popup has no folder ID. Resolve it from the
+            // actual paginated shelves rather than reporting an empty selection.
+            for (let folderId of Object.keys(folders)) {
+                if (await this.findFavorite(comicId, folderId)) return { folders: folders, favorited: [folderId] }
             }
-            let document = new HtmlDocument(res.body)
-            let data = {}
-            document.querySelectorAll("option").forEach((option => {
-                if (option.attributes["value"] === "") return
-                data[option.attributes["value"]] = option.text
-            }))
-            return {
-                folders: data,
-                favorited: []
-            }
+            throw 'Incomplete favorite status: could not confirm its folder'
         },
         /**
          * add a folder
@@ -586,43 +709,39 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{comics: Comic[], maxPage: number}>}
          */
         loadComics: async (page, folder) => {
-            let url = `${this.baseUrl}/users-users_fav-page-${page}-c-${folder}.html.html`
-            let res = await Network.get(url, {})
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
-            }
-            let document = new HtmlDocument(res.body)
-            let comicBlocks = document.querySelectorAll("div.asTB")
-            let comics = comicBlocks.map((comic) => {
-                let cover = comic.querySelector("div.asTBcell.thumb > div > img").attributes["src"]
-                cover = 'https:' + cover
-                let time = comic.querySelector("div.box_cel.u_listcon > p.l_catg > span").text.replaceAll("創建時間：", "")
-                let name = comic.querySelector("div.box_cel.u_listcon > p.l_title > a").text;
-                let link = comic.querySelector("div.box_cel.u_listcon > p.l_title > a").attributes["href"];
-                let id = RegExp("(?<=-aid-)[0-9]+").exec(link)[0];
-                let info = comic.querySelector("div.box_cel.u_listcon > p.l_detla").text;
-                let pages = Number(RegExp("(?<=頁數：)[0-9]+").exec(info)[0])
-                let delUrl = comic.querySelector("div.box_cel.u_listcon > p.alopt > a").attributes["onclick"];
-                let favoriteId = RegExp("(?<=del-id-)[0-9]+").exec(delUrl)[0];
-                return new Comic({
-                    id: id,
-                    title: name,
-                    subtitle: time,
-                    cover: cover,
-                    pages: pages,
-                    favoriteId: favoriteId,
+            let url = `${this.baseUrl}/users-users_fav-page-${page}-c-${folder || '0'}.html`
+            let document = new HtmlDocument(await this.getPage(url, { 'cache-time': 'no' }))
+            try {
+                this.checkFavoriteSession(document)
+                let comicBlocks = document.querySelectorAll("div.asTB")
+                if (!comicBlocks.length) this.favoriteFolders(document)
+                let comics = comicBlocks.map((comic) => {
+                    let cover = comic.querySelector('div.asTBcell.thumb img')
+                    let title = comic.querySelector('div.box_cel.u_listcon > p.l_title > a')
+                    let id = (title && title.attributes.href || '').match(/-aid-(\d+)/)
+                    let remove = comic.querySelector('div.box_cel.u_listcon > p.alopt > a')
+                    let favoriteId = remove && ((remove.attributes.onclick || '') + ' ' + (remove.attributes.href || '')).match(/fav_del-id-(\d+)/)
+                    if (!cover || !title || !title.text.trim() || !id || !favoriteId) throw 'Invalid favorite comic row'
+                    let time = comic.querySelector('div.box_cel.u_listcon > p.l_catg > span')
+                    let metadata = comic.querySelector('div.box_cel.u_listcon > p.l_detla')
+                    let info = metadata ? metadata.text.trim() : ''
+                    let pages = info.match(/[頁页][數数]\s*[：:]\s*(\d+)/)
+                    return new Comic({
+                        id: id[1],
+                        title: title.text.trim(),
+                        subtitle: time ? time.text.replaceAll('創建時間：', '').trim() : '',
+                        cover: this.absoluteUrl(cover.attributes.src),
+                        description: info,
+                        maxPage: pages ? Number(pages[1]) : undefined,
+                        favoriteId: favoriteId[1],
+                    })
                 })
-            })
-            let pages = 1
-            let pagesLink = document.querySelectorAll("div.f_left.paginator > a")
-            if (pagesLink.length > 0) {
-                pages = Number(pagesLink[pagesLink.length - 1].text)
-            }
-            document.dispose()
-            return {
-                comics: comics,
-                maxPage: pages,
-            }
+                let pages = this.maxPage(document, Math.max(page, 1))
+                return {
+                    comics: comics,
+                    maxPage: pages,
+                }
+            } finally { document.dispose() }
         }
     }
 
@@ -634,37 +753,59 @@ class Wnacg extends ComicSource {
          * @returns {Promise<ComicDetails>}
          */
         loadInfo: async (id) => {
-            let res = await Network.get(`${this.baseUrl}/photos-index-page-1-aid-${id}.html`, {})
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
+            let document = new HtmlDocument(await this.getPage(`${this.baseUrl}/photos-index-page-1-aid-${id}.html`))
+            try {
+                let title = document.querySelector('div.userwrap > h2')
+                let cover = document.querySelector('div.asTBcell.uwthumb > img')
+                if (!title || !cover) throw 'Invalid comic detail page'
+                let labels = {}
+                for (let e of document.querySelectorAll('div.asTBcell.uwconn > label')) {
+                    let match = e.text.match(/^\s*([^：:]+)[：:]\s*(.*)$/)
+                    if (match) labels[match[1].trim()] = match[2].trim()
+                }
+                let chapters = this.chapterLinks(document)
+                let collection = document.querySelector('#sr_pub')
+                if (collection) {
+                    let total = Number(collection.attributes['data-total'])
+                    let perPage = Number(collection.attributes['data-per'])
+                    let template = collection.attributes['data-pageurl'] || ''
+                    if (total > 0 && !chapters.size) throw 'Incomplete collection chapter list'
+                    if (total > chapters.size) {
+                        if (!(perPage > 0) || !/(?:\[#page#\]|%5b%23page%23%5d)/i.test(template)) {
+                            throw 'Incomplete collection chapter list: missing pagination'
+                        }
+                        for (let page = 2; page <= Math.ceil(total / perPage); page++) {
+                            let link = template.replace(/\[#page#\]|%5b%23page%23%5d/ig, String(page))
+                            let more = new HtmlDocument(await this.getPage(this.absoluteUrl(link)))
+                            try {
+                                for (let [key, value] of this.chapterLinks(more)) chapters.set(key, value)
+                            } finally { more.dispose() }
+                        }
+                        if (chapters.size !== total) throw 'Incomplete collection chapter list'
+                    }
+                }
+                let tags = new Map()
+                for (let name of ['頁數', '章節', '分類']) {
+                    if (labels[name]) tags.set(name, [labels[name]])
+                }
+                let tagList = document.querySelectorAll('a.tagshow').filter(e =>
+                    !e.attributes['data-chid'] && !/-aid-\d+/.test(e.attributes.href || '')
+                ).map(e => e.text.trim()).filter(Boolean)
+                if (tagList.length) tags.set('標籤', tagList)
+                let description = document.querySelector('div.asTBcell.uwconn > p')
+                let uploader = document.querySelector('div.asTBcell.uwuinfo > a > p')
+                return new ComicDetails({
+                    title: title.text.trim(),
+                    cover: this.absoluteUrl(cover.attributes.src),
+                    tags: tags,
+                    chapters: chapters.size ? chapters : undefined,
+                    description: description ? description.text.trim() : '',
+                    uploader: uploader ? uploader.text.trim() : '',
+                    url: `${this.baseUrl}/photos-index-page-1-aid-${id}.html`,
+                })
+            } finally {
+                document.dispose()
             }
-            let document = new HtmlDocument(res.body)
-            let title = document.querySelector("div.userwrap > h2").text
-            let cover = document.querySelector("div.userwrap > div.asTB > div.asTBcell.uwthumb > img").attributes["src"]
-            cover = 'https:' + cover
-            cover = cover.substring(0, 6) + cover.substring(8)
-            let labels = document.querySelectorAll("div.asTBcell.uwconn > label")
-            let category = labels[0].text.split("：")[1]
-            let pages = labels[1].text.split("：")[1];
-            let tagsDom = document.querySelectorAll("a.tagshow");
-            let tags = new Map()
-            tags.set("頁數", [pages])
-            tags.set("分類", [category])
-            if (tagsDom.length > 0) {
-                tags.set("標籤", tagsDom.map((e) => e.text))
-            }
-            let description = document.querySelector("div.asTBcell.uwconn > p").text;
-            let uploader = document.querySelector("div.asTBcell.uwuinfo > a > p").text;
-
-            return new ComicDetails({
-                id: id,
-                title: title,
-                cover: cover,
-                pages: pages,
-                tags: tags,
-                description: description,
-                uploader: uploader,
-            })
         },
         /**
          * [Optional] load thumbnails of a comic
@@ -673,23 +814,30 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{thumbnails: string[], next: string?}>} - `next` is next page token, null for no more
          */
         loadThumbnails: async (id, next) => {
-            next = next || '1'
-            let res = await Network.get(`${this.baseUrl}/photos-index-page-${next}-aid-${id}.html`, {});
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
+            let target = String(id), page = 1
+            if (next) {
+                let token = String(next).match(/^(\d+):(\d+)$/)
+                if (token) { target = token[1]; page = Number(token[2]) }
+                else if (/^\d+$/.test(String(next))) page = Number(next)
+                else throw 'Invalid thumbnail page token'
             }
-            let document = new HtmlDocument(res.body)
-            let thumbnails = document.querySelectorAll("div.pic_box.tb > a > img").map((e) => {
-                return 'https:' + e.attributes["src"]
-            })
-            next = (Number(next) + 1).toString()
-            let pagesLink = document.querySelector("div.f_left.paginator").children
-            if (pagesLink[pagesLink.length - 1].classNames.includes("thispage")) {
-                next = null
-            }
-            return {
-                thumbnails: thumbnails,
-                next: next
+            let document = new HtmlDocument(await this.getPage(`${this.baseUrl}/photos-index-page-${page}-aid-${target}.html`))
+            try {
+                let thumbnails = document.querySelectorAll('div.pic_box.tb > a > img').map(e => this.absoluteUrl(e.attributes.src))
+                if (!thumbnails.length) {
+                    // Collections have chapters instead of their own thumbnail grid.
+                    let firstChapter = this.chapterLinks(document).keys().next().value
+                    if (firstChapter && firstChapter !== target && page === 1) {
+                        return await this.comic.loadThumbnails(firstChapter, null)
+                    }
+                    throw 'No thumbnails found on comic page'
+                }
+                return {
+                    thumbnails: thumbnails,
+                    next: page < this.maxPage(document, page) ? `${target}:${page + 1}` : null,
+                }
+            } finally {
+                document.dispose()
             }
         },
         /**
@@ -699,15 +847,25 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{images: string[]}>}
          */
         loadEp: async (comicId, epId) => {
-            let res = await Network.get(`${this.baseUrl}/photos-gallery-aid-${comicId}.html`, {})
-            if (res.status !== 200) {
-                throw `Invalid Status Code ${res.status}`
+            let target = epId || comicId
+            let body = await this.getPage(`${this.baseUrl}/photos-gallery-aid-${target}.html`)
+            // Decode only string literals. Never execute the site's JavaScript.
+            let parseString = value => JSON.parse(value.replace(/[\u0000-\u001f]/g,
+                c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')))
+            let lines = Array.from(body.matchAll(/document\.writeln\(("(?:\\.|[^"\\])*")\);/g))
+            if (lines.length) body = lines.map(m => parseString(m[1])).join('\n')
+            let list = body.match(/\bimglist\s*=\s*(\[[\s\S]*?\]);/)
+            if (!list) throw 'Invalid gallery image list'
+            let host = body.match(/\bfast_img_host\s*=\s*("(?:\\.|[^"\\])*")/)
+            host = host ? parseString(host[1]) : ''
+            let images = []
+            for (let m of list[1].matchAll(/\burl\s*:\s*(fast_img_host\s*\+\s*)?("(?:\\.|[^"\\])*")/g)) {
+                let value = parseString(m[2])
+                if (value.replace(/[?#].*$/, '') === '/themes/weitu/images/bg/shoucang.jpg') continue
+                images.push(this.absoluteUrl((m[1] ? host : '') + value))
             }
-            const regex = RegExp(String.raw`//[^"]+/[^"]+\.[^"]+`, 'g');
-            const matches = Array.from(res.body.matchAll(regex));
-            return {
-                images: matches.map((e) => 'https:' + e[0].substring(0, e[0].length - 1))
-            }
+            if (!images.length) throw 'No reading images found in gallery'
+            return { images: images }
         },
         /**
          * [Optional] Handle tag click event
@@ -724,14 +882,13 @@ class Wnacg extends ComicSource {
     }
 
     get settings() {
-        // 动态生成选项，总是保留 Custom Domain (0)，然后根据 Wnacg.domains 数量添加选项
-        let domainOptions = [{ value: '0', text: 'Custom Domain' }]
-        for (let i = 0; i < Wnacg.domains.length; i++) {
-            domainOptions.push({
-                value: String(i + 1),
-                text: Wnacg.domains[i]
-            })
-        }
+        // Venera reads settings once, before init. Keep persisted choices stable.
+        let domainOptions = [
+            { value: '0', text: 'Custom Domain' },
+            { value: '1', text: 'Domain 1' },
+            { value: '2', text: 'Domain 2' },
+            { value: '3', text: 'Domain 3' },
+        ]
 
         return {
             refreshDomains: {
