@@ -10,7 +10,7 @@ class HotManga extends ComicSource {
 
     key = "hot_manga"
 
-    version = "1.0.0"
+    version = "1.0.1"
 
     minAppVersion = "1.6.0"
 
@@ -713,7 +713,7 @@ class HotManga extends ComicSource {
                     param: null,
                 }
             }
-            throw "未支持此类Tag检索"
+            return;
         }
     }
 
