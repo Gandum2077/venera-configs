@@ -5,7 +5,7 @@ class Baozi extends ComicSource {
   // 唯一标识符
   key = "baozi";
 
-  version = "1.1.9";
+  version = "1.1.10";
 
   minAppVersion = "1.0.0";
 
@@ -500,6 +500,12 @@ class Baozi extends ComicSource {
         .replace(/月/g, "-")
         .replace(/日/g, "");
 
+      let isFavorite;
+      if (this.isLogged) {
+        const shelf = await this.favorites.loadComics(1);
+        isFavorite = shelf.comics.some(comic => comic.id === id);
+      }
+
       return new ComicDetails({
         title: title,
         cover: cover,
@@ -511,6 +517,7 @@ class Baozi extends ComicSource {
         chapters: chapters,
         recommend: recommend,
         updateTime: updateDate,
+        isFavorite: isFavorite,
       });
     },
     loadEp: async (comicId, epId) => {
