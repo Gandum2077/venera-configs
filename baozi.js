@@ -5,12 +5,15 @@ class Baozi extends ComicSource {
   // 唯一标识符
   key = "baozi";
 
-  version = "1.1.6";
+  version = "1.1.8";
 
   minAppVersion = "1.0.0";
 
   // 更新链接
   url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/baozi.js";
+
+  // 原生宿主在源注册前读取登录元数据，固定账号入口不能提前读取设置。
+  accountUrl = "https://www.baozimh.com";
 
   settings = {
     language: {
@@ -33,12 +36,13 @@ class Baozi extends ComicSource {
         { value: "twmanga.com" },
         { value: "dinnerku.com" },
       ],
-      default: "bzmgcn.com",
+      default: "twmanga.com",
     },
     cdn_domains: {
       title: "图片资源站域名",
       type: "select",
       options: [
+        { value: "s1.baozimh.com" },
         { value: "as-rsa1-usla.baozicdn.com" },
         { value: "ascn-a3.bzcdn.net" },
         { value: "asgb-a3.bzcdn.net" },
@@ -71,7 +75,40 @@ class Baozi extends ComicSource {
   }
   get baseUrl() {
     let domain = this.loadSetting("domains") || this.settings.domains.default;
+    // 旧默认入口已跳转到要求额外验证的站点；保留已有设置的可读性。
+    if (domain === "bzmgcn.com") domain = "twmanga.com";
     return `https://${this.lang}.${domain}`;
+  }
+
+  checkResponse(res) {
+    if (/challenge_required|__gatekeeper_challenge|cf-chl-|Just a moment\.\.\./i.test(res.body || "")) {
+      throw `反爬验证未完成 (anti_bot, HTTP ${res.status})，请在当前域名网页登录后重试`;
+    }
+    if (res.status !== 200) throw "Invalid status code: " + res.status;
+  }
+
+  async accountRequest(method, path, headers = {}, body = null) {
+    let res;
+    try {
+      res = await Network.sendRequest(method, this.accountUrl + path, {
+        ...headers,
+        // 原生宿主默认缓存 GET 五秒，登录验证必须读取当前服务端状态。
+        "cache-time": "no",
+      }, body, {
+        maskHeadersInLog: ["Cookie", "cookie"],
+        maskDataInLog: true,
+        maskResponseInLog: true,
+      });
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (/CloudflareException/i.test(message)) throw "CloudflareException: " + this.accountUrl;
+      if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(message)) throw "Network request failed: DNS ENOTFOUND";
+      if (/CERT_|TLS|SSL/i.test(message)) throw "Network request failed: TLS error";
+      if (/timeout|timed out|AbortError/i.test(message)) throw "Network request timeout";
+      throw "Network request failed: 账号请求连接失败，请检查网络后重试";
+    }
+    this.checkResponse(res);
+    return res;
   }
 
   /// 账号
@@ -80,8 +117,8 @@ class Baozi extends ComicSource {
     /// 登录
     /// 返回任意值表示登录成功
     login: async (account, pwd) => {
-      let res = await Network.post(
-        `${this.baseUrl}/api/bui/signin`,
+      let res = await this.accountRequest(
+        "POST", "/api/bui/signin",
         {
           "content-type":
             "multipart/form-data; boundary=----WebKitFormBoundaryFUNUxpOwyUaDop8s",
@@ -92,30 +129,43 @@ class Baozi extends ComicSource {
         pwd +
         "\r\n------WebKitFormBoundaryFUNUxpOwyUaDop8s--\r\n"
       );
-      if (res.status !== 200) {
-        throw "Invalid status code: " + res.status;
+      let json;
+      try { json = JSON.parse(res.body); } catch (_) { throw "登录响应格式无效，请使用网页登录"; }
+      let token = json?.data;
+      if (!json?.result || typeof token !== "string" || !token.trim() || /[\r\n;]/.test(token)) {
+        throw "登录失败：未返回有效会话";
       }
-      let json = JSON.parse(res.body);
-      let token = json.data;
-      Network.setCookies(this.baseUrl, [
-        new Cookie({
-          name: "TSID",
-          value: token,
-          domain: this.loadSetting("domains") || this.settings.domains.default,
-        }),
-      ]);
+      const previous = Network.getCookies(this.accountUrl + "/user/my_bookshelf") || [];
+      try {
+        Network.setCookies(this.accountUrl, [
+          new Cookie({ name: "TSID", value: token, domain: ".baozimh.com" }),
+        ]);
+        // HTTP 200 和非空 token 都不能证明会话有效；先读取受保护书架。
+        await this.favorites.loadComics(1);
+      } catch (error) {
+        Network.deleteCookies(this.accountUrl);
+        Network.setCookies(this.accountUrl, previous);
+        throw error;
+      }
       return "ok";
     },
 
     // 退出登录时将会调用此函数
-    logout: function () {
-      Network.deleteCookies(
-        this.loadSetting("domains") || this.settings.domains.default
-      );
+    logout: () => {
+      Network.deleteCookies(this.accountUrl);
+      this.deleteData("account");
     },
 
-    get registerWebsite() {
-      return `${this.baseUrl}/user/signup`;
+    registerWebsite: `${this.accountUrl}/user/signup`,
+
+    loginWithWebview: {
+      url: `${this.accountUrl}/user/my_bookshelf`,
+      checkStatus: (url, title) => {
+        if (typeof url !== "string" || typeof title !== "string" ||
+            !/^我的[书書]架\s*-\s*包子漫[画畫]$/.test(title.trim())) return false;
+        return url === `${this.accountUrl}/user/my_bookshelf` ||
+          url === `${this.accountUrl}/user/my_bookshelf/`;
+      },
     },
   };
 
@@ -159,9 +209,7 @@ class Baozi extends ComicSource {
 
       load: async () => {
         var res = await Network.get(this.baseUrl);
-        if (res.status !== 200) {
-          throw "Invalid status code: " + res.status;
-        }
+        this.checkResponse(res);
         let document = new HtmlDocument(res.body);
         let parts = document.querySelectorAll("div.index-recommend-items");
         let result = {};
@@ -174,6 +222,7 @@ class Baozi extends ComicSource {
             result[title] = comics;
           }
         }
+        if (Object.keys(result).length === 0) throw "未找到探索列表，页面结构可能已变化";
         return result;
       },
     },
@@ -269,17 +318,12 @@ class Baozi extends ComicSource {
       let res = await Network.get(
         `${this.baseUrl}/api/bzmhq/amp_comic_list?type=${param}&region=${options[0]}&state=${options[1]}&filter=%2a&page=${page}&limit=36&language=${this.lang}&__amp_source_origin=${this.baseUrl}`
       );
-      if (res.status !== 200) {
-        throw "Invalid status code: " + res.status;
-      }
-      let maxPage = null;
+      this.checkResponse(res);
       let json = JSON.parse(res.body);
-      if (!json.next) {
-        maxPage = page;
-      }
+      if (!Array.isArray(json.items)) throw "分类响应缺少漫画列表";
       return {
         comics: json.items.map((e) => this.parseJsonComic(e)),
-        maxPage: maxPage,
+        ...(!json.next ? { maxPage: page } : {}),
       };
     },
     // 提供选项
@@ -296,11 +340,10 @@ class Baozi extends ComicSource {
   /// 搜索
   search = {
     load: async (keyword, options, page) => {
-      let res = await Network.get(`${this.baseUrl}/search?q=${keyword}`);
-      if (res.status !== 200) {
-        throw "Invalid status code: " + res.status;
-      }
+      let res = await Network.get(`${this.baseUrl}/search?q=${encodeURIComponent(keyword)}`);
+      this.checkResponse(res);
       let document = new HtmlDocument(res.body);
+      if (!document.querySelector('form[action="/search"]')) throw "未找到搜索页面，页面结构可能已变化";
       let comics = document
         .querySelectorAll("div.comics-card")
         .map((e) => this.parseComic(e));
@@ -320,34 +363,26 @@ class Baozi extends ComicSource {
     multiFolder: false,
     /// 添加或者删除收藏
     addOrDelFavorite: async (comicId, folderId, isAdding) => {
-      if (!isAdding) {
-        let res = await Network.post(
-          `${this.baseUrl}/user/operation_v2?op=del_bookmark&comic_id=${comicId}`
-        );
-        if (!res.status || res.status >= 400) {
-          throw "Invalid status code: " + res.status;
-        }
-        return "ok";
-      } else {
-        let res = await Network.post(
-          `${this.baseUrl}/user/operation_v2?op=set_bookmark&comic_id=${comicId}&chapter_slot=0`
-        );
-        if (!res.status || res.status >= 400) {
-          throw "Invalid status code: " + res.status;
-        }
-        return "ok";
-      }
+      if (typeof comicId !== "string" || !comicId || typeof isAdding !== "boolean") throw "无效收藏操作";
+      const contains = shelf => shelf.comics.some(comic => comic.id === comicId);
+      if (contains(await this.favorites.loadComics(1)) === isAdding) return "ok";
+      const op = isAdding ? "set_bookmark" : "del_bookmark";
+      await this.accountRequest("POST", `/user/operation_v2?op=${op}&comic_id=${encodeURIComponent(comicId)}${isAdding ? "&chapter_slot=0" : ""}`);
+      if (contains(await this.favorites.loadComics(1)) !== isAdding) throw "收藏状态未确认，请刷新书架后重试";
+      return "ok";
     },
     // 加载收藏夹, 仅当multiFolder为true时有效
     // 当comicId不为null时, 需要同时返回包含该漫画的收藏夹
     loadFolders: null,
     /// 加载漫画
     loadComics: async (page, folder) => {
-      let res = await Network.get(`${this.baseUrl}/user/my_bookshelf`);
-      if (res.status !== 200) {
-        throw "Invalid status code: " + res.status;
-      }
+      let res = await this.accountRequest("GET", "/user/my_bookshelf");
       let document = new HtmlDocument(res.body);
+      const title = document.querySelector("title")?.text.trim() || "";
+      if (!/^我的[书書]架\s*-\s*包子漫[画畫]$/.test(title) ||
+          !document.querySelector('a[href*="op=logout"]')) {
+        throw "书架返回了未登录或异常页面（即使 HTTP 200），请在 www.baozimh.com 重新网页登录";
+      }
       function parseComic(e) {
         let title = e.querySelector("h4 > a").text.trim();
         let url = e.querySelector("h4 > a").attributes["href"];
@@ -383,9 +418,7 @@ class Baozi extends ComicSource {
     // 加载漫画信息
     loadInfo: async (id) => {
       let res = await Network.get(`${this.baseUrl}/comic/${id}`);
-      if (res.status !== 200) {
-        throw "Invalid status code: " + res.status;
-      }
+      this.checkResponse(res);
       let document = new HtmlDocument(res.body);
 
       let title = document.querySelector("h1.comics-detail__title").text.trim();
@@ -428,29 +461,21 @@ class Baozi extends ComicSource {
         .querySelector("p.comics-detail__desc")
         .text.trim();
       let chapters = new Map();
-      let i = 0;
-      for (let c of document.querySelectorAll(
-        "div#chapter-items > div.comics-chapters > a > div > span"
-      )) {
-        chapters.set(i.toString(), c.text.trim());
-        i++;
+      let chapterLinks = document.querySelectorAll("#chapter-items .comics-chapters > a, #chapters_other_list .comics-chapters > a");
+      if (!chapterLinks.length) chapterLinks = document.querySelectorAll("div.comics-chapters > a").reverse();
+      for (let c of chapterLinks) {
+        const href = c.attributes.href || "";
+        const section = href.match(/[?&]section_slot=(\d+)(?:&|$)/)?.[1];
+        const slot = href.match(/[?&]chapter_slot=(\d+)(?:&|$)/)?.[1];
+        const pathSlots = href.match(/\/(\d+)_(\d+)\.html(?:[?#]|$)/);
+        const sectionId = section ?? pathSlots?.[1];
+        const chapterId = slot ?? pathSlots?.[2];
+        if (sectionId === undefined || chapterId === undefined) throw "章节链接缺少真实编号";
+        const epId = sectionId === "0" ? chapterId : `${sectionId}_${chapterId}`;
+        if (chapters.has(epId)) throw "章节编号重复";
+        chapters.set(epId, c.text.trim());
       }
-      for (let c of document.querySelectorAll(
-        "div#chapters_other_list > div.comics-chapters > a > div > span"
-      )) {
-        chapters.set(i.toString(), c.text.trim());
-        i++;
-      }
-      if (i === 0) {
-        // 将倒序的最新章节反转
-        const spans = Array.from(
-          document.querySelectorAll("div.comics-chapters > a > div > span")
-        ).reverse();
-        for (let c of spans) {
-          chapters.set(i.toString(), c.text.trim());
-          i++;
-        }
-      }
+      if (!chapters.size) throw "未找到章节，页面结构可能已变化";
       let recommend = [];
       for (let c of document.querySelectorAll("div.recommend--item")) {
         if (c.querySelectorAll("div.tag-comic").length > 0) {
@@ -487,29 +512,30 @@ class Baozi extends ComicSource {
     loadEp: async (comicId, epId) => {
       const images = [];
 
-      // App版链接
-      let currentPageUrl = `https://appcn.baozimh.com/baozimhapp/comic/chapter/${comicId}/0_${epId}.html`;
+      if (!/^\d+(?:_\d+)?$/.test(String(epId))) throw "无效章节编号";
+      const slots = String(epId).includes("_") ? String(epId) : `0_${epId}`;
+      let currentPageUrl = `${this.baseUrl}/comic/chapter/${encodeURIComponent(comicId)}/${slots}.html`;
 
       const res = await Network.get(currentPageUrl);
-      if (res.status !== 200) {
-        throw `Invalid status code: ${res.status}`;
-      }
+      this.checkResponse(res);
 
       const doc = new HtmlDocument(res.body);
 
-      // 解析当前页图片(App 版)
-      const imageNodes = doc.querySelectorAll(".comic-contain > .chapter-img");
+      const imageNodes = doc.querySelectorAll(".comic-contain amp-img.comic-contain__item");
       imageNodes.forEach((imgNode) => {
-        let imgUrl = imgNode.querySelector(".comic-contain__item")?.attributes?.["data-src"];
+        let imgUrl = imgNode.attributes.src || imgNode.attributes["data-src"];
         if (imgUrl) {
           const match = imgUrl.match(/^(https?:\/\/)?([^/\s:]+)(:\d+)?(\/[a-z]comic\/.*)/);
           if (match) {
-            const domain = this.loadSetting("cdn_domains") === "" ? match[2] : this.loadSetting("cdn_domains");
-            imgUrl = `${match[1]}${domain}${this.loadSetting("image_quality")}${match[4]}`;
+            // 网页运行时会把失效的 bzcdn 图片入口切换到 baozimh CDN。
+            const domain = this.loadSetting("cdn_domains") || match[2].replace(/^s(\d+)\.bzcdn\.net$/, "s$1.baozimh.com");
+            const quality = this.loadSetting("image_quality") ?? this.settings.image_quality.default;
+            imgUrl = `${match[1] || "https://"}${domain}${match[3] || ""}${quality}${match[4]}`;
           }
           images.push(imgUrl);
         }
       });
+      if (!images.length) throw "未找到正文图片，页面结构可能已变化或需要网页验证";
       return { images: images };
     },
   };
