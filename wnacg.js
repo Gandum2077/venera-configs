@@ -7,7 +7,7 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.0.9"
+    version = "1.0.10"
 
     minAppVersion = "1.0.0"
 
@@ -281,6 +281,7 @@ class Wnacg extends ComicSource {
         if (!Object.keys(folders).length && !document.querySelector('a[href*="favclass"]')) {
             throw 'Invalid favorites folder page'
         }
+        folders['0'] = this.translate('All')
         return folders
     }
 
@@ -627,6 +628,9 @@ class Wnacg extends ComicSource {
          * @returns {Promise<any>} - return any value to indicate success
          */
         addOrDelFavorite: async (comicId, folderId, isAdding, favoriteId) => {
+            if (isAdding && (!folderId || String(folderId) === '0')) {
+                throw 'All is a collection view; select a specific favorite folder'
+            }
             if (!isAdding) {
                 if (!favoriteId) {
                     let found = await this.findFavorite(comicId, folderId)
@@ -667,13 +671,11 @@ class Wnacg extends ComicSource {
                 if (popup.querySelector('form select[name="favc_id"]')) return { folders: folders, favorited: [] }
                 let notice = popup.querySelector('div.box_container')
                 if (!notice || !/已[經经]收藏/.test(notice.text)) throw 'Invalid favorite status response'
+                // The popup confirms membership, but does not identify a folder.
+                // All contains every favorite. Venera calls this on every detail
+                // open, so never scan shelves to resolve a specific folder here.
+                return { folders: folders, favorited: ['0'] }
             } finally { popup.dispose() }
-            // The already-favorited popup has no folder ID. Resolve it from the
-            // actual paginated shelves rather than reporting an empty selection.
-            for (let folderId of Object.keys(folders)) {
-                if (await this.findFavorite(comicId, folderId)) return { folders: folders, favorited: [folderId] }
-            }
-            throw 'Incomplete favorite status: could not confirm its folder'
         },
         /**
          * add a folder
@@ -695,6 +697,7 @@ class Wnacg extends ComicSource {
          * @returns {Promise<void>} - return any value to indicate success
          */
         deleteFolder: async (folderId) => {
+            if (!folderId || String(folderId) === '0') throw 'Cannot delete the All collection view'
             let res = await Network.get(`${this.baseUrl}/users-favclass_del-id-${folderId}.html?ajax=true&_t=${randomDouble()}`, {})
             if (res.status !== 200) {
                 throw 'Delete failed'
@@ -919,6 +922,9 @@ class Wnacg extends ComicSource {
 
     translation = {
         'zh_CN': {
+            'All': '全部',
+            'All is a collection view; select a specific favorite folder': '全部是汇总视图，请选择具体收藏夹',
+            'Cannot delete the All collection view': '不能删除全部收藏汇总视图',
             'Refresh Domain List': '刷新域名列表',
             'Refresh': '刷新',
             'Refresh Domain List on Startup': '启动时刷新域名列表',
@@ -931,6 +937,9 @@ class Wnacg extends ComicSource {
             'Month': '月',
         },
         'zh_TW': {
+            'All': '全部',
+            'All is a collection view; select a specific favorite folder': '全部是彙總檢視，請選擇具體收藏夾',
+            'Cannot delete the All collection view': '不能刪除全部收藏彙總檢視',
             'Refresh Domain List': '刷新域名列表',
             'Refresh': '刷新',
             'Refresh Domain List on Startup': '啟動時刷新域名列表',
