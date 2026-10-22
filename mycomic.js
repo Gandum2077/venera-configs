@@ -1,6 +1,7 @@
 /** @type {import('./_venera_.js')} */
 
 const BASE_URL = "https://mycomic.com/cn";
+const ORIGIN = "https://mycomic.com";
 const CDN_URL = "https://biccam.com";
 const REFERER = "https://mycomic.com/";
 
@@ -23,40 +24,164 @@ const headers = {
     "Sec-Ch-Ua-Platform": '"Windows"',
 };
 
-/**
- * Check if the response is a Cloudflare challenge page
- * @param {number} status
- * @param {string} body
- * @returns {boolean}
- */
-function isCloudflareChallenge(status, body) {
-    if (status === 403 || status === 503) {
-        if (body && (body.indexOf("challenge-platform") !== -1 ||
-            body.indexOf("cf-browser-verification") !== -1 ||
-            body.indexOf("Just a moment") !== -1 ||
-            body.indexOf("__cf_chl_") !== -1)) {
-            return true;
-        }
-        return true;
-    }
-    if (body && body.indexOf("challenge-platform") !== -1) {
-        return true;
-    }
-    return false;
+function responseText(body) {
+    if (body === null || body === undefined) return "";
+    return typeof body === "string" ? body : Convert.decodeUtf8(body);
+}
+
+function isCloudflareChallenge(status, body, responseHeaders) {
+    const mitigated = Object.keys(responseHeaders || {}).some(key =>
+        key.toLowerCase() === "cf-mitigated" && String(responseHeaders[key]).toLowerCase() === "challenge");
+    return mitigated || /<title[^>]*>\s*(?:Just a moment|Checking your browser|Attention Required!\s*\|\s*Cloudflare)/i.test(body) ||
+        /(?:id=["']cf-(?:chl|browser-verification)|__cf_chl_)/i.test(body) ||
+        ((status === 403 || status === 503) && /challenge-platform|cf-browser-verification/i.test(body));
 }
 
 /**
  * Wrapper for Network.get that detects Cloudflare challenges
- * and throws a user-friendly error guiding them to login
+ * and preserves Venera's interactive verification marker
  * @param {string} url
  * @returns {Promise<{status: number, headers: object, body: string}>}
  */
 async function fetchWithCFCheck(url) {
     const resp = await Network.get(url, headers);
-    if (isCloudflareChallenge(resp.status, resp.body)) {
-        throw "Cloudflare 验证拦截：请在漫画源设置中点击「登录」，通过内置浏览器完成一次 Cloudflare 验证后即可正常使用。";
+    resp.body = responseText(resp.body);
+    if (isCloudflareChallenge(resp.status, resp.body, resp.headers)) {
+        // Venera recognizes this marker and opens its Cloudflare verification UI.
+        throw "CloudflareException: " + url;
     }
     return resp;
+}
+
+// Mask credential requests and ask supporting hosts to mask private responses.
+// Older native hosts ignore maskResponseInLog; it is not a privacy guarantee.
+async function accountRequest(method, url, data, useXsrf) {
+    const requestHeaders = {
+        "User-Agent": UA,
+        "Referer": BASE_URL + "/bookmarks",
+        "Origin": ORIGIN,
+        "Accept": method === "GET" ? "text/html" : "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "cache-time": "no",
+    };
+    if (method !== "GET") requestHeaders["Content-Type"] = "application/json";
+    if (useXsrf) {
+        const token = (Network.getCookies(ORIGIN + "/") || []).find(cookie => cookie.name === "XSRF-TOKEN");
+        if (!token || !token.value) throw "登录验证信息缺失，请先通过 Cloudflare 验证后重新登录";
+        try { requestHeaders["X-XSRF-TOKEN"] = decodeURIComponent(token.value); }
+        catch (_) { throw "登录验证信息无效，请重新登录"; }
+    }
+    const extra = {
+        followRedirects: false,
+        maskDataInLog: true, maskResponseInLog: true, maskQueryInLog: true,
+        maskHeadersInLog: ["Cookie", "cookie", "X-XSRF-TOKEN", "x-xsrf-token", "Set-Cookie", "set-cookie"],
+    };
+    let result;
+    try {
+        const body = data === undefined ? null : JSON.stringify(data);
+        // The direct bridge also masks logs on hosts whose Network wrappers do
+        // not forward the optional extra argument.
+        result = typeof sendMessage === "function"
+            ? await sendMessage({ method: "http", http_method: method, url, headers: requestHeaders, data: body, extra })
+            : await Network.sendRequest(method, url, requestHeaders, body, extra);
+        if (result.error) throw result.error;
+    } catch (error) {
+        const message = String(error && error.message || error);
+        if (/CloudflareException/i.test(message)) throw "CloudflareException: " + url;
+        if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(message)) throw "Network request failed: DNS ENOTFOUND";
+        if (/timeout|timed out|AbortError/i.test(message)) throw "Network request timeout";
+        throw "Network request failed: 网络请求失败，请稍后重试";
+    }
+    result.body = responseText(result.body);
+    if (isCloudflareChallenge(result.status, result.body, result.headers)) throw "CloudflareException: " + url;
+    if (result.status === 401) throw "Login expired: 登录会话失效，请重新登录";
+    if (result.status === 419) throw "Login expired: 登录验证信息已过期，请重新登录";
+    if (result.status < 200 || result.status >= 300) throw "账号请求失败，HTTP " + result.status;
+    return result;
+}
+
+function bookmarkPage(html) {
+    const doc = new HtmlDocument(html);
+    const logout = doc.querySelectorAll("button").some(button =>
+        /axios\.post\(\s*['"](?:https:\/\/mycomic\.com)?\/logout['"]/.test(button.attributes["@click"] || ""));
+    if (!logout) {
+        if (/登入以继续|登入以繼續|登录以继续|登入|登錄|登录/.test(doc.text || html)) {
+            throw "Login expired: 请先登录 MYCOMIC 账号，仅通过 Cloudflare 验证不能读取收藏";
+        }
+        throw "收藏页面结构无法识别，未确认账号登录";
+    }
+    const table = doc.querySelector("table[data-flux-table]");
+    if (!table) {
+        if (/未有记录|未有紀錄|暂无记录|暫無記錄/.test(doc.text || html)) return { comics: [], maxPage: 1 };
+        throw "收藏页面结构已变化，未找到收藏表格";
+    }
+    const body = table.querySelector("tbody");
+    if (!body) throw "收藏页面结构已变化，未找到收藏条目区域";
+    const rows = body.querySelectorAll("tr");
+    const empty = /未有记录|未有紀錄|暂无记录|暫無記錄/.test(body.text);
+    if (!body.querySelector("a[href*='/cn/comics/']") && empty) return { comics: [], maxPage: 1 };
+    if (!rows.length) throw "收藏页面未确认空收藏，无法读取全部收藏";
+    const comics = [], seen = new Set();
+    for (const row of rows) {
+        const link = row.querySelector("a[href*='/cn/comics/']");
+        const match = /^(?:https:\/\/mycomic\.com)?\/cn\/comics\/([1-9]\d*)(?:[?#].*)?$/.exec(link && link.attributes["href"] || "");
+        const image = row.querySelector("img");
+        const cover = image && (image.attributes["data-src"] || image.attributes["src"]);
+        const title = ((image && image.attributes["alt"]) || (link && (link.attributes["title"] || link.text)) || "").trim();
+        if (!match || !title || !cover || !/^https:\/\//.test(cover)) throw "收藏条目不完整，无法读取全部收藏";
+        if (seen.has(match[1])) throw "收藏页面包含重复条目，无法确认完整收藏";
+        seen.add(match[1]);
+        const chapter = row.querySelector("a[href*='/cn/chapters/']");
+        comics.push(new Comic({ id: match[1], title, cover, description: chapter ? chapter.text.trim() : "", language: "zh-Hans" }));
+    }
+    return { comics, maxPage: parseMaxPage(html) };
+}
+
+async function loadBookmarkPage(page) {
+    const suffix = page > 1 ? "?page=" + page : "";
+    const response = await accountRequest("GET", BASE_URL + "/bookmarks" + suffix);
+    return bookmarkPage(response.body);
+}
+
+function comicId(value) {
+    const id = String(value);
+    if (!/^[1-9]\d*$/.test(id)) throw "漫画 ID 无效";
+    return id;
+}
+
+async function bookmarkState(id) {
+    const response = await accountRequest("POST", ORIGIN + "/comics/" + comicId(id), {}, true);
+    let state;
+    try { state = JSON.parse(response.body); }
+    catch (_) { throw "收藏状态接口未返回有效 JSON"; }
+    if (!state || typeof state.isLoggedIn !== "boolean" || typeof state.hasBookmarked !== "boolean") {
+        throw "收藏状态接口响应结构已变化";
+    }
+    if (!state.isLoggedIn) throw "Login expired: 登录会话失效，请重新登录";
+    return state.hasBookmarked;
+}
+
+async function importAccountCookies(values) {
+    const raw = values && values[0];
+    if (typeof raw !== "string" || !raw.trim() || /[\r\n]/.test(raw)) return false;
+    const cookies = [];
+    for (const part of raw.replace(/^Cookie:\s*/i, "").split(";")) {
+        const match = /^\s*([!#$%&'*+.^_`|~\w-]+)=([^;]*)$/.exec(part);
+        if (!match) return false;
+        cookies.push(new Cookie({ name: match[1], value: match[2].trim(), domain: ".mycomic.com", path: "/" }));
+    }
+    const previous = Network.getCookies(ORIGIN + "/") || [];
+    Network.deleteCookies(ORIGIN);
+    Network.setCookies(ORIGIN, cookies);
+    try {
+        await loadBookmarkPage(1);
+        return true;
+    } catch (error) {
+        Network.deleteCookies(ORIGIN);
+        Network.setCookies(ORIGIN, previous);
+        if (/Login expired/.test(String(error))) return false;
+        throw error;
+    }
 }
 
 /**
@@ -141,7 +266,7 @@ function parseComicList(doc) {
  * @returns {number}
  */
 function parseMaxPage(html) {
-    const pageMatches = html.match(/(?:href="[^"]*page=)(\d+)/g);
+    const pageMatches = html.match(/(?:href=['"][^'"]*page=)(\d+)/g);
     if (!pageMatches) return 1;
     let max = 1;
     pageMatches.forEach((m) => {
@@ -177,14 +302,14 @@ class MyComic extends ComicSource {
 
     key = "mycomic";
 
-    version = "1.1.0";
+    version = "1.1.1";
 
     minAppVersion = "1.4.6";
 
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/mycomic.js";
 
     init() {
-        // Check if cf_clearance cookie exists; if not, the user may need to "login"
+        // Cloudflare clearance is separate from the MYCOMIC account session.
         const cookies = Network.getCookies("https://mycomic.com");
         let hasCfClearance = false;
         if (cookies && cookies.length > 0) {
@@ -196,70 +321,62 @@ class MyComic extends ComicSource {
             }
         }
         if (!hasCfClearance) {
-            console.log("[MyComic] No cf_clearance cookie found. User may need to login.");
+            console.log("[MyComic] 如遇 Cloudflare 拦截，请先使用 Venera 的验证页面完成验证，再登录账号。");
         }
     }
 
-    // ==================== Account (Cloudflare bypass) ====================
+    // ==================== Account ====================
 
     account = {
-        // Method 1: WebView login - opens mycomic.com in a real browser engine
-        // The browser will automatically solve Cloudflare's JS challenge,
-        // and the resulting cf_clearance cookie will be stored for Network requests.
-        loginWithWebview: {
-            url: "https://mycomic.com/cn",
-            checkStatus: (url, title) => {
-                // Cloudflare challenge page has title "Just a moment..." or similar
-                // After the challenge is passed, the real site loads
-                if (!url || !title) return false;
-                if (title.indexOf("moment") !== -1) return false;
-                if (title.indexOf("Cloudflare") !== -1) return false;
-                if (title.indexOf("challenge") !== -1) return false;
-                // Success: we're on the actual mycomic.com page
-                if (url.indexOf("mycomic.com") !== -1) return true;
-                return false;
-            },
-            onLoginSuccess: () => {
-                // Cookies from WebView should be synced with Network API automatically.
-                // Log for debugging.
-                const cookies = Network.getCookies("https://mycomic.com");
-                console.log("[MyComic] Login success. Cookies: " + (cookies ? cookies.length : 0));
-            },
+        login: async (email, password) => {
+            if (typeof email !== "string" || typeof password !== "string" || !email.trim() || !password) {
+                throw "Login failed: 请填写邮箱和密码";
+            }
+            // Venera's password form takes precedence over cookie fields. This
+            // explicit mode keeps full-cookie import usable in the same form.
+            if (email.trim().toLowerCase() === "cookie") {
+                if (!await importAccountCookies([password])) throw "Login failed: Cookie 未包含有效账号会话";
+                return "ok";
+            }
+            // Obtain Laravel's session/XSRF cookies before sending credentials.
+            // A challenge is thrown here, so credentials are never posted to it.
+            await accountRequest("GET", BASE_URL + "/bookmarks");
+            await accountRequest("POST", BASE_URL + "/login", { email: email.trim(), password }, true);
+            await loadBookmarkPage(1);
+            return "ok";
         },
-
-        // Method 2: Manual cookie input - user can paste cf_clearance value
-        // obtained from their browser's dev tools
+        // Kept for adapters using the cookie validator directly. Native Venera
+        // must render its username/password form when account.login is present.
         loginWithCookies: {
-            fields: ["cf_clearance"],
-            validate: async (values) => {
-                if (!values || !values[0]) return false;
-                // Set the cf_clearance cookie
-                Network.setCookies("https://mycomic.com", [
-                    new Cookie({
-                        name: "cf_clearance",
-                        value: values[0],
-                        domain: ".mycomic.com",
-                    }),
-                ]);
-                // Validate by trying to fetch the homepage
-                try {
-                    const resp = await Network.get(
-                        "https://mycomic.com/cn",
-                        headers
-                    );
-                    return resp.status === 200 &&
-                        !isCloudflareChallenge(resp.status, resp.body);
-                } catch (e) {
-                    return false;
-                }
-            },
+            fields: null,
+            validate: importAccountCookies,
         },
 
         logout: () => {
-            Network.deleteCookies("https://mycomic.com");
+            Network.deleteCookies(ORIGIN);
+            this.deleteData("account");
         },
 
         registerWebsite: null,
+    };
+
+    favorites = {
+        multiFolder: false,
+        loadComics: async (page) => {
+            const requestedPage = page || 1;
+            if (!Number.isInteger(requestedPage) || requestedPage < 1) throw "收藏页码无效";
+            return await loadBookmarkPage(requestedPage);
+        },
+        addOrDelFavorite: async (id, folderId, isAdding) => {
+            id = comicId(id);
+            if (typeof isAdding !== "boolean") throw "收藏操作无效";
+            await loadBookmarkPage(1);
+            const before = await bookmarkState(id);
+            if (before === isAdding) return "ok";
+            await accountRequest(isAdding ? "POST" : "DELETE", ORIGIN + "/comics/" + id + "/bookmark", {}, true);
+            if (await bookmarkState(id) !== isAdding) throw "收藏操作未生效，请刷新后重试";
+            return "ok";
+        },
     };
 
     // ==================== Explore ====================
@@ -594,6 +711,7 @@ class MyComic extends ComicSource {
                 }
             }
 
+            const isFavorite = this.isLogged ? await bookmarkState(id) : undefined;
             return new ComicDetails({
                 title: title,
                 cover: cover,
@@ -603,6 +721,7 @@ class MyComic extends ComicSource {
                 thumbnails: [cover],
                 url: url,
                 uploader: author || undefined,
+                isFavorite,
             });
         },
 

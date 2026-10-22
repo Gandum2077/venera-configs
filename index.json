@@ -174,7 +174,7 @@
         "name": "MYCOMIC",
         "fileName": "mycomic.js",
         "key": "mycomic",
-        "version": "1.1.0",
-        "description": "mycomic.com漫画源, 遇到Cloudflare验证请在源设置中登录"
+        "version": "1.1.1",
+        "description": "mycomic.com 漫画源，支持邮箱密码、Cookie 登录与收藏；Cloudflare 请使用应用内验证页"
     }
 ]
