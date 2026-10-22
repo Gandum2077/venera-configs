@@ -7,7 +7,7 @@ class JM extends ComicSource {
     // unique id of the source
     key = "jm"
 
-    version = "1.4.0"
+    version = "1.4.3"
 
     minAppVersion = "1.5.0"
 
@@ -250,12 +250,13 @@ class JM extends ComicSource {
     /**
      *
      * @param url {string}
+     * @param headers {object}
      * @returns {Promise<string>}
      */
-    async get(url) {
+    async get(url, headers = {}) {
         let time = Math.floor(Date.now() / 1000)
         let kJmSecret = "185Hcomic3PAPP7R"
-        let res = await Network.get(url, this.getApiHeaders(time))
+        let res = await Network.get(url, { ...this.getApiHeaders(time), ...headers })
         if(res.status !== 200) {
             if(res.status === 401) {
                 let json = JSON.parse(res.body)
@@ -705,7 +706,7 @@ class JM extends ComicSource {
          * @returns {Promise<{folders: {[p: string]: string}, favorited: string[]}>} - `folders` is a map of folder id to folder name, `favorited` is a list of folder id which contains the comic
          */
         loadFolders: async (comicId) => {
-            let res = await this.get(`${this.baseUrl}/favorite`)
+            let res = await this.get(`${this.baseUrl}/favorite`, { "cache-time": "no" })
             let folders = {
                 "0": this.translate("All")
             }
@@ -713,9 +714,50 @@ class JM extends ComicSource {
             for (let e of json.folder_list) {
                 folders[e.FID.toString()] = e.name
             }
+            let favorited = []
+            if (comicId != null) {
+                let id = comicId.toString().replace(/^jm/, '')
+                if (!this.isNum(id)) throw 'Invalid comic id'
+                let info = await this.comic.loadInfo(id)
+                // Preserve direct All-list evidence if the API's flag disagrees.
+                let listed = Array.isArray(json.list) && json.list.some((comic) => comic.id.toString() === id)
+                let isFavorite = info.isFavorite || listed
+                if (isFavorite && !this.loadSetting('exactFavoriteFolders')) {
+                    // 0 is the aggregate "All" entry and contains every favorite.
+                    // Do not scan the library on the default details-page path.
+                    favorited.push('0')
+                } else if (isFavorite) {
+                    // The album only reports membership, not its folder. Venera also
+                    // uses the folder IDs to select the current folder in its UI.
+                    for (let folderId of Object.keys(folders)) {
+                        if (folderId === '0') continue
+                        let page = 1
+                        let seen = new Set()
+                        while (true) {
+                            let result = await this.favorites.loadComics(page, folderId)
+                            if (!Number.isSafeInteger(result.maxPage) || result.maxPage < 0) {
+                                throw 'Invalid favorite pagination'
+                            }
+                            for (let comic of result.comics) {
+                                if (seen.has(comic.id)) throw 'Invalid favorite pagination'
+                                seen.add(comic.id)
+                            }
+                            if (result.comics.some((comic) => comic.id === id)) {
+                                favorited.push(folderId)
+                                break
+                            }
+                            if (page >= result.maxPage) break
+                            page++
+                        }
+                        if (favorited.length) break
+                    }
+                    // Favorites outside custom folders remain in "All".
+                    if (!favorited.length) favorited.push('0')
+                }
+            }
             return {
                 folders: folders,
-                favorited: []
+                favorited: favorited
             }
         },
         /**
@@ -743,10 +785,17 @@ class JM extends ComicSource {
          */
         loadComics: async (page, folder) => {
             let order = this.loadSetting('favoriteOrder')
-            let res = await this.get(`${this.baseUrl}/favorite?folder_id=${folder}&page=${page}&o=${order}`)
+            let res = await this.get(`${this.baseUrl}/favorite?folder_id=${folder}&page=${page}&o=${order}`, { "cache-time": "no" })
             let json = JSON.parse(res)
             let total = json.total
+            if (typeof total === 'string' && /^\d+$/.test(total)) total = Number(total)
+            if (!Number.isSafeInteger(total) || total < 0 || !Array.isArray(json.list)) {
+                throw 'Invalid favorite pagination'
+            }
             let maxPage = Math.ceil(total / 20)
+            if (json.list.length > total || (total > 0 && page <= maxPage && !json.list.length)) {
+                throw 'Invalid favorite pagination'
+            }
             let comics = json.list.map((e) => this.parseComic(e))
             return {
                 comics: comics,
@@ -767,8 +816,9 @@ class JM extends ComicSource {
             if (id.startsWith('jm')) {
                 id = id.substring(2)
             }
-            let res = await this.get(`${this.baseUrl}/album?id=${id}`);
+            let res = await this.get(`${this.baseUrl}/album?id=${id}`, this.isLogged ? { "cache-time": "no" } : {});
             let data = JSON.parse(res)
+            if (this.isLogged && typeof data.is_favorite !== 'boolean') throw 'Invalid favorite status'
             let author = data.author ?? []
             let works = data.works ?? []
             let actors = data.actors ?? []
@@ -1055,6 +1105,11 @@ class JM extends ComicSource {
             ],
             default: 'mr'
         },
+        exactFavoriteFolders: {
+            title: "Exact Favorite Folders (Slower)",
+            type: "switch",
+            default: false,
+        },
         dailyCheckInTask: {
             title: "Daily Check-in Task",
             type: "switch",
@@ -1077,6 +1132,7 @@ class JM extends ComicSource {
             'Api Domain': 'Api域名',
             'Image Stream': '图片分流',
             'Favorite Order': '收藏夹排序',
+            'Exact Favorite Folders (Slower)': '精确显示收藏夹（加载较慢）',
             'Daily Check-in Task': '每日自动签到',
             'Manual Check-In': '手动签到',
             'Check-In': '签到',
@@ -1096,6 +1152,7 @@ class JM extends ComicSource {
             'Api Domain': 'Api域名',
             'Image Stream': '圖片分流',
             'Favorite Order': '收藏夾排序',
+            'Exact Favorite Folders (Slower)': '精確顯示收藏夾（載入較慢）',
             'Daily Check-in Task': '每日自動簽到',
             'Manual Check-In': '手動簽到',
             'Check-In': '簽到',
