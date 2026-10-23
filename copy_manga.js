@@ -4,20 +4,20 @@ class CopyManga extends ComicSource {
 
     key = "copy_manga"
 
-    version = "1.4.2"
+    version = "1.4.4"
 
     minAppVersion = "1.6.0"
 
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/copy_manga.js"
 
     async getReqID() {
-        if (this.copyRegion === "0") {
+        if (!this.usesAppApi || this.copyRegion === "0") {
             return "";
         }
         const reqIdUrl = "https://marketing.aiacgn.com/api/v2/adopr/query3/?format=json&ident=200100001";
         let reqId = "";
         try {
-            const response = await Network.get(reqIdUrl, this.headers);
+            const response = await Network.get(reqIdUrl, this.appHeaders);
 
             if (response.status === 200) {
                 const data = JSON.parse(response.body);
@@ -28,7 +28,7 @@ class CopyManga extends ComicSource {
         return reqId;
     }
 
-    get headers() {
+    get appHeaders() {
         let token = this.loadData("token");
         let secret = "M2FmMDg1OTAzMTEwMzJlZmUwNjYwNTUwYTA1NjNhNTM="
 
@@ -51,13 +51,13 @@ class CopyManga extends ComicSource {
         )
 
         return {
-            "User-Agent": `COPY/3.0.6`,
+            "User-Agent": `COPY/${CopyManga.appVersion}`,
             "source": "copyApp",
             "deviceinfo": this.deviceinfo,
             "dt": `${year}.${month}.${day}`,
             "platform": "3",
-            "referer": `com.copymanga.app-3.0.6`,
-            "version": "3.0.6",
+            "referer": `com.copymanga.app-${CopyManga.appVersion}`,
+            "version": CopyManga.appVersion,
             "device": this.device,
             "pseudoid": this.pseudoid,
             "Accept": "application/json",
@@ -69,7 +69,41 @@ class CopyManga extends ComicSource {
         }
     }
 
-    // static defaultCopyVersion = "3.0.6"
+    static appVersion = "3.0.9"
+
+    // Public client protocol used by coffee522/extensions-copymanga b6a3b04.
+    static browserVersion = "2025.11.21"
+
+    static browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
+
+    get usesAppApi() {
+        return this.loadSetting('api_mode') === 'app';
+    }
+
+    get headers() {
+        if (this.usesAppApi) return this.appHeaders;
+        const token = this.loadData('token');
+        return {
+            'User-Agent': CopyManga.browserUA,
+            'Accept': 'application/json',
+            'version': CopyManga.browserVersion,
+            'webp': '1',
+            'platform': '1',
+            'Origin': this.webUrl,
+            'Referer': `${this.webUrl}/`,
+            // Venera creates a fresh dart:io client for this host transport.
+            // Connection: close also prevents idle HTTP/1.1 reuse in patrol.
+            'http_client': 'dart:io',
+            'Connection': 'close',
+            ...(token ? { 'authorization': `Token ${token}` } : {}),
+        };
+    }
+
+    readQuery(requestId) {
+        return this.usesAppApi
+            ? `in_mainland=true&request_id=${encodeURIComponent(requestId)}&platform=3`
+            : 'platform=1';
+    }
 
     // static defaultCopyPlatform = "2"
 
@@ -77,7 +111,7 @@ class CopyManga extends ComicSource {
 
     static defaultImageQuality = "1500"
 
-    static defaultApiUrl = 'api.copy2000.online'
+    static defaultApiUrl = 'api.copy202601.com'
 
     static searchApi = "/api/kb/web/searchb/comics"
 
@@ -154,22 +188,165 @@ class CopyManga extends ComicSource {
     }
 
     get apiUrl() {
-        return `https://${this.loadSetting('base_url')}`
+        let host = this.loadSetting('base_url') || CopyManga.defaultApiUrl;
+        // Follow official discovery for both new installs and the former default.
+        // An explicitly configured alternative remains under the user's control.
+        if (host === 'api.copy2000.online' || host === CopyManga.defaultApiUrl) {
+            host = this._appApi || CopyManga.defaultApiUrl;
+        }
+        return `https://${host}`
     }
 
     get copyRegion() {
-        return this.loadSetting('region') || this.defaultCopyRegion
+        return this.loadSetting('region') || CopyManga.defaultCopyRegion
     }
 
     get imageQuality() {
-        return this.loadSetting('image_quality') || this.defaultImageQuality
+        return this.loadSetting('image_quality') || CopyManga.defaultImageQuality
     }
 
     init() {
         // 用于储存 { 作者名 : 英文参数 }
         this.author_path_word_dict = {}
-        this.refreshSearchApi()
-        this.refreshAppApi()
+        return Promise.all([this.refreshSearchApi(), this.refreshAppApi()]);
+    }
+
+    parseResponse(res) {
+        let data;
+        try {
+            data = JSON.parse(res.body);
+        } catch (_) {
+            throw `Invalid API response (HTTP ${res.status})`;
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw `Invalid API response (HTTP ${res.status})`;
+        }
+        if (res.status !== 200 || (data.code !== undefined && data.code !== 200)) {
+            let message = data.message || data.results?.detail || 'Request failed';
+            const error = new Error(`HTTP ${res.status} / API ${data.code ?? res.status}: ${message}`);
+            error.appRestricted = res.status === 210 || data.code === 210;
+            throw error;
+        }
+        if (!data.results || typeof data.results !== 'object') {
+            throw 'Invalid API response: missing results';
+        }
+        return data.results;
+    }
+
+    isAppRestricted(res) {
+        if (res.status === 210) return true;
+        try { return JSON.parse(res.body)?.code === 210; } catch (_) { return false; }
+    }
+
+    get webUrl() {
+        return `https://${this.loadSetting('web_url') || 'www.copy4000.com'}`;
+    }
+
+    async webPage(path) {
+        // Public website requests must not carry App credentials or device IDs.
+        const res = await Network.get(this.webUrl + path, { 'User-Agent': 'Mozilla/5.0' });
+        if (res.status !== 200) throw `Public website HTTP ${res.status}`;
+        if (/cf-chl-|challenge-platform|Just a moment|Attention Required/i.test(res.body)) {
+            throw 'Public website anti-bot challenge';
+        }
+        return res.body;
+    }
+
+    decodeWebContent(value, key) {
+        if (typeof value !== 'string' || typeof key !== 'string' ||
+            Convert.encodeUtf8(key).byteLength !== 16 || value.length <= 16 ||
+            !/^[0-9a-f]+$/i.test(value.substring(16)) || (value.length - 16) % 32 !== 0) {
+            throw 'Invalid public website encrypted content';
+        }
+        const hex = value.substring(16);
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        const plain = new Uint8Array(Convert.decryptAesCbc(
+            bytes.buffer, Convert.encodeUtf8(key), Convert.encodeUtf8(value.substring(0, 16)),
+        ));
+        const padding = plain[plain.length - 1];
+        if (padding < 1 || padding > 16 || !plain.slice(-padding).every(byte => byte === padding)) {
+            throw 'Invalid public website content padding';
+        }
+        return JSON.parse(Convert.decodeUtf8(plain.slice(0, -padding).buffer));
+    }
+
+    async loadWebInfo(id) {
+        const html = await this.webPage(`/comic/${encodeURIComponent(id)}`);
+        const doc = new HtmlDocument(html);
+        try {
+            const title = doc.querySelector('.comicParticulars-title-right h6')?.text.trim();
+            const image = doc.querySelector('.comicParticulars-left-img img');
+            const cover = image?.attributes['data-src'] || image?.attributes.src;
+            const uuid = doc.querySelector('a.collect')?.attributes.onclick?.match(/collect\(['"]([^'"]+)['"]\)/)?.[1];
+            const key = html.match(/\bvar\s+ccz\s*=\s*['"]([^'"]+)['"]/)?.[1];
+            const dnts = doc.querySelector('#dnt')?.attributes.value;
+            if (!title || !/^https?:\/\//.test(cover || '') || !uuid || !key || !dnts) {
+                throw 'Invalid public website comic details';
+            }
+            const res = await Network.get(`${this.webUrl}/comicdetail/${encodeURIComponent(id)}/chapters`, {
+                'User-Agent': 'Mozilla/5.0', 'Referer': `${this.webUrl}/comic/${encodeURIComponent(id)}`, dnts,
+            });
+            let payload;
+            try { payload = JSON.parse(res.body); } catch (_) { throw `Invalid website chapters (HTTP ${res.status})`; }
+            if (res.status !== 200 || payload?.code !== 200) throw `Public website chapters HTTP ${res.status} / API ${payload?.code}`;
+            const decoded = this.decodeWebContent(payload.results, key);
+            const groups = decoded?.groups;
+            if (!groups || typeof groups !== 'object' || Array.isArray(groups) || !Object.keys(groups).length) {
+                throw 'Invalid public website chapter groups';
+            }
+            const chapters = new Map();
+            for (const group of Object.values(groups)) {
+                if (!group?.name || !Array.isArray(group.chapters) ||
+                    !Number.isInteger(group.count) || group.count !== group.chapters.length) {
+                    throw 'Incomplete public website chapter group';
+                }
+                const entries = new Map();
+                for (const chapter of group.chapters) {
+                    if (!chapter?.id || !chapter.name || entries.has(chapter.id)) throw 'Invalid public website chapter';
+                    entries.set(chapter.id, chapter.name);
+                }
+                if (chapters.has(group.name)) throw 'Duplicate public website chapter group';
+                chapters.set(group.name, entries);
+            }
+            if (Object.keys(this.author_path_word_dict).length > 100) this.author_path_word_dict = {};
+            const authors = [];
+            for (const node of doc.querySelectorAll('.comicParticulars-title-right a[href^="/author/"]')) {
+                const path = node.attributes.href.match(/^\/author\/([^/]+)\/comics/);
+                if (path) { authors.push(node.text.trim()); this.author_path_word_dict[node.text.trim()] = decodeURIComponent(path[1]); }
+            }
+            const tags = doc.querySelectorAll('.comicParticulars-tag a').map(node => node.text.trim().replace(/^#/, ''));
+            const rows = doc.querySelectorAll('.comicParticulars-title-right li');
+            const metadata = label => rows.find(node => node.text.includes(label))?.querySelector('.comicParticulars-right-txt')?.text.trim();
+            return {
+                title, cover, description: doc.querySelector('p.intro')?.text.trim() || '', subId: uuid,
+                tags: { '作者': authors, '更新': [metadata('最後更新') || ''], '标签': tags, '状态': [metadata('狀態') || ''] },
+                chapters,
+            };
+        } finally {
+            doc.dispose();
+        }
+    }
+
+    async loadWebEp(comicId, epId) {
+        const html = await this.webPage(`/comic/${encodeURIComponent(comicId)}/chapter/${encodeURIComponent(epId)}`);
+        const key = html.match(/\bvar\s+cct\s*=\s*['"]([^'"]+)['"]/)?.[1];
+        const value = html.match(/\bvar\s+contentKey\s*=\s*['"]([^'"]+)['"]/)?.[1];
+        const content = this.decodeWebContent(value, key);
+        if (!Array.isArray(content) || !content.length ||
+            content.some(page => typeof page?.url !== 'string' || !/^https?:\/\//.test(page.url))) {
+            throw 'Invalid public website chapter images';
+        }
+        return { images: content.map(page => page.url.replace(/([./])c\d+x\.[a-zA-Z]+$/, `$1c${this.imageQuality}x.webp`)) };
+    }
+
+    async webInfoAfterRestriction(id, appError) {
+        console.error(`App details rejected; reading the public website: ${appError}`);
+        try {
+            return await this.loadWebInfo(id);
+        } catch (webError) {
+            throw `${appError}; Public website failed: ${webError}`;
+        }
     }
 
     /// account
@@ -182,7 +359,7 @@ class CopyManga extends ComicSource {
             let res = await Network.post(
                 `${this.apiUrl}/api/v3/login`,
                 {
-                    ...this.headers,
+                    ...this.appHeaders,
                     "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"
                 },
                 `username=${account}&password=${base64}\n&salt=${salt}&authorization=Token+`
@@ -552,17 +729,20 @@ class CopyManga extends ComicSource {
             let token = this.loadData("token");
             let reqId = await this.getReqID();
             let comicData = await Network.get(
-                `${this.apiUrl}/api/v3/comic2/${comicId}?in_mainland=true&request_id=${reqId}&platform=3`,
+                `${this.apiUrl}/api/v3/comic2/${comicId}?${this.readQuery(reqId)}`,
                 this.headers
             )
-            if (comicData.status !== 200) {
-                throw `Invalid status code: ${comicData.status}`
+            let comic_id;
+            try {
+                comic_id = this.parseResponse(comicData).comic.uuid;
+            } catch (appError) {
+                if (!this.isAppRestricted(comicData)) throw appError;
+                comic_id = (await this.webInfoAfterRestriction(comicId, appError)).subId;
             }
-            let comic_id = JSON.parse(comicData.body).results.comic.uuid
             let res = await Network.post(
                 `${this.apiUrl}/api/v3/member/collect/comic`,
                 {
-                    ...this.headers,
+                    ...this.appHeaders,
                     "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
                 },
                 `comic_id=${comic_id}&is_collect=${is_collect}&authorization=Token+${token}`
@@ -624,18 +804,21 @@ class CopyManga extends ComicSource {
     }
 
     comic = {
+        onImageLoad: () => ({ headers: {
+            'User-Agent': CopyManga.browserUA, 'Referer': `${this.webUrl}/`,
+        } }),
+        onThumbnailLoad: () => ({ headers: {
+            'User-Agent': CopyManga.browserUA, 'Referer': `${this.webUrl}/`,
+        } }),
         loadInfo: async (id) => {
             let getChapters = async (id, groups) => {
                 let fetchSingle = async (id, path) => {
                     let reqId = await this.getReqID();
                     let res = await Network.get(
-                        `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=0&in_mainland=true&request_id=${reqId}`,
+                        `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=0&${this.readQuery(reqId)}`,
                         this.headers
                     );
-                    if (res.status !== 200) {
-                        throw `Invalid status code: ${res.status}`;
-                    }
-                    let data = JSON.parse(res.body);
+                    let data = { results: this.parseResponse(res) };
                     let eps = new Map();
                     data.results.list.forEach((e) => {
                         let title = e.name;
@@ -647,13 +830,10 @@ class CopyManga extends ComicSource {
                         let offset = 100;
                         while (offset < maxChapter) {
                             res = await Network.get(
-                                `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=${offset}`,
+                                `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=${offset}&${this.readQuery(reqId)}`,
                                 this.headers
                             );
-                            if (res.status !== 200) {
-                                throw `Invalid status code: ${res.status}`;
-                            }
-                            data = JSON.parse(res.body);
+                            data = { results: this.parseResponse(res) };
                             data.results.list.forEach((e) => {
                                 let title = e.name;
                                 let id = e.uuid;
@@ -696,25 +876,32 @@ class CopyManga extends ComicSource {
 
             let getFavoriteStatus = async (id) => {
                 let res = await Network.get(`${this.apiUrl}/api/v3/comic2/${id}/query`, this.headers);
-                if (res.status !== 200) {
-                    throw `Invalid status code: ${res.status}`;
+                if (this.isAppRestricted(res)) {
+                    // Unknown account state must not prevent public reading or
+                    // be mistaken for a successful "not favorited" response.
+                    let reason;
+                    try { this.parseResponse(res); } catch (error) { reason = error; }
+                    console.error(`Favorite status unavailable: ${reason}`);
+                    return null;
                 }
-                return JSON.parse(res.body).results.collect != null;
+                return this.parseResponse(res).collect != null;
             }
             let reqId = await this.getReqID();
             let results = await Promise.all([
                 Network.get(
-                    `${this.apiUrl}/api/v3/comic2/${id}?in_mainland=true&request_id=${reqId}&platform=3`,
+                    `${this.apiUrl}/api/v3/comic2/${id}?${this.readQuery(reqId)}`,
                     this.headers
                 ),
                 getFavoriteStatus.bind(this)(id)
             ])
 
-            if (results[0].status !== 200) {
-                throw `Invalid status code: ${results[0].status}`;
+            let data;
+            try {
+                data = this.parseResponse(results[0]);
+            } catch (appError) {
+                if (!this.isAppRestricted(results[0])) throw appError;
+                return { ...await this.webInfoAfterRestriction(id, appError), isFavorite: results[1] };
             }
-
-            let data = JSON.parse(results[0].body).results;
             let comicData = data.comic;
 
             let title = comicData.name;
@@ -729,7 +916,13 @@ class CopyManga extends ComicSource {
             let tags = comicData.theme.map(e => e?.name).filter(name => name !== undefined && name !== null);
             let updateTime = comicData.datetime_updated ? comicData.datetime_updated : "";
             let description = comicData.brief;
-            let chapters = await getChapters(id, data.groups);
+            let chapters;
+            try {
+                chapters = await getChapters(id, data.groups);
+            } catch (appError) {
+                if (!appError.appRestricted) throw appError;
+                return { ...await this.webInfoAfterRestriction(id, appError), isFavorite: results[1] };
+            }
             let status = comicData.status.display;
 
             return {
@@ -748,79 +941,62 @@ class CopyManga extends ComicSource {
             }
         },
         loadEp: async (comicId, epId) => {
-            let attempt = 0;
             const maxAttempts = 5;
-            let res;
-            let data;
 
-            while (attempt < maxAttempts) {
-                try {
-                    let reqId = await this.getReqID();
-                    res = await Network.get(
-                        `${this.apiUrl}/api/v3/comic/${comicId}/chapter2/${epId}?in_mainland=true&request_id=${reqId}`,
-                        {
-                            ...this.headers
-                        }
-                    );
-
-                    if (res.status === 210) {
-                        // 210 indicates too frequent access, extract wait time
-                        let waitTime = 40000; // Default wait time 40s
-                        try {
-                            let responseBody = JSON.parse(res.body);
-                            if (
-                                responseBody.message &&
-                                responseBody.message.includes("Expected available in")
-                            ) {
-                                let match = responseBody.message.match(/(\d+)\s*seconds/);
-                                if (match && match[1]) {
-                                    waitTime = parseInt(match[1]) * 1000;
-                                }
-                            }
-                        } catch (e) {
-                            console.log(
-                                "Unable to parse wait time, using default wait time 40s"
-                            );
-                        }
-                        console.log(`Chapter${epId} access too frequent, waiting ${waitTime / 1000}s`);
-                        await new Promise((resolve) => setTimeout(resolve, waitTime));
-                        throw "Retry";
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                let reqId = await this.getReqID();
+                let res = await Network.get(
+                    `${this.apiUrl}/api/v3/comic/${comicId}/chapter2/${epId}?${this.readQuery(reqId)}`,
+                    {
+                        ...this.headers
                     }
+                );
 
-                    if (res.status !== 200) {
-                        throw `Invalid status code: ${res.status}`;
-                    }
-
-                    data = JSON.parse(res.body);
-                    // console.log(data.results.chapter);
-                    // Handle image link sorting
-                    let imagesUrls = data.results.chapter.contents.map((e) => e.url);
-                    let orders = data.results.chapter.words;
-
-                    // Replace origin images urls to selected quality images urls
-                    let hdImagesUrls = imagesUrls.map((url) =>
-                        url.replace(/([./])c\d+x\.[a-zA-Z]+$/, `$1c${this.imageQuality}x.webp`)
-                    )
-
-                    let images = new Array(hdImagesUrls.length).fill(""); // Initialize an array with the same length as imagesUrls
-
-                    // Arrange images according to orders
-                    for (let i = 0; i < hdImagesUrls.length; i++) {
-                        images[orders[i]] = hdImagesUrls[i];
-                    }
-
-                    return {
-                        images: images,
-                    };
-                } catch (error) {
-                    if (error !== "Retry") {
-                        throw error;
-                    }
-                    attempt++;
-                    if (attempt >= maxAttempts) {
-                        throw error;
+                if (res.status === 210) {
+                    let responseBody;
+                    try { responseBody = JSON.parse(res.body); } catch (_) { }
+                    // 210 also means an app/account restriction. Only the
+                    // explicit short rate-limit response authorizes a retry.
+                    let match = typeof responseBody?.message === 'string'
+                        ? responseBody.message.match(/Expected available in\s+(\d+)\s*seconds/i)
+                        : null;
+                    let seconds = match ? Number(match[1]) : -1;
+                    if (seconds >= 0 && seconds <= 60 && attempt + 1 < maxAttempts) {
+                        await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+                        continue;
                     }
                 }
+                if (this.isAppRestricted(res)) {
+                    let appError;
+                    try { this.parseResponse(res); } catch (error) { appError = error; }
+                    console.error(`App chapter rejected; reading the public website: ${appError}`);
+                    try {
+                        return await this.loadWebEp(comicId, epId);
+                    } catch (webError) {
+                        throw `${appError}; Public website failed: ${webError}`;
+                    }
+                }
+                let data = { results: this.parseResponse(res) };
+                // console.log(data.results.chapter);
+                // Handle image link sorting
+                let imagesUrls = data.results.chapter.contents.map((e) => e.url);
+                let orders = data.results.chapter.words;
+
+                // Replace origin images urls to selected quality images urls
+                let hdImagesUrls = imagesUrls.map((url) =>
+                    url.replace(/([./])c\d+x\.[a-zA-Z]+$/, `$1c${this.imageQuality}x.webp`)
+                )
+
+                let images = new Array(hdImagesUrls.length).fill(""); // Initialize an array with the same length as imagesUrls
+
+                // Arrange images according to orders
+                for (let i = 0; i < hdImagesUrls.length; i++) {
+                    images[orders[i]] = hdImagesUrls[i];
+                }
+
+                return {
+                    images: images,
+                };
             }
         },
         loadComments: async (comicId, subId, page, replyTo) => {
@@ -869,7 +1045,7 @@ class CopyManga extends ComicSource {
             let res = await Network.post(
                 `${this.apiUrl}/api/v3/member/comment`,
                 {
-                    ...this.headers,
+                    ...this.appHeaders,
                     "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
                 },
                 `comic_id=${subId}&comment=${encodeURIComponent(content)}&reply_id=${replyTo}`,
@@ -923,7 +1099,7 @@ class CopyManga extends ComicSource {
             let res = await Network.post(
                 `${this.apiUrl}/api/v3/member/roast`,
                 {
-                    ...this.headers,
+                    ...this.appHeaders,
                     "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
                 },
                 `chapter_id=${epId}&roast=${encodeURIComponent(content)}`,
@@ -961,11 +1137,29 @@ class CopyManga extends ComicSource {
                     param: null,
                 }
             }
-            throw "未支持此类Tag检索"
+            return;
         }
     }
 
     settings = {
+        api_mode: {
+            title: "读取协议",
+            type: "select",
+            options: [
+                { value: 'browser', text: '网页客户端 API（推荐）' },
+                { value: 'app', text: '原 App API' },
+            ],
+            default: 'browser',
+        },
+        web_url: {
+            title: "网页读取地址（App 接口受限时使用）",
+            type: "select",
+            options: [
+                { value: 'www.copy4000.com', text: 'copy4000.com' },
+                { value: 'www.mangacopy.com', text: 'mangacopy.com' },
+            ],
+            default: 'www.copy4000.com',
+        },
         favorites_ordering: {
             title: "收藏排序方式",
             type: "select",
@@ -1082,24 +1276,32 @@ class CopyManga extends ComicSource {
     }
 
     async refreshSearchApi() {
-        let url = "https://www.copy20.com/search"
-        let res = await fetch(url)
-        let searchApi = ""
-        if (res.status === 200) {
-            let text = await res.text()
-            let match = text.match(/const countApi = "([^"]+)"/)
+        try {
+            let res = await Network.get("https://www.copy4000.com/search");
+            if (res.status !== 200) throw `HTTP ${res.status}`;
+            let match = res.body.match(/const countApi = "([^"]+)"/)
             if (match && match[1]) {
+                if (!/^\/api\/[a-zA-Z0-9/_-]+$/.test(match[1])) throw 'Invalid search API path';
                 CopyManga.searchApi = match[1]
             }
+        } catch (error) {
+            console.error(`Search API discovery failed: ${error}`);
         }
     }
 
     async refreshAppApi() {
-        const url = "https://api.copy-manga.com/api/v3/system/network2?platform=3"
-        const res = await fetch(url, { headers: this.headers });
-        if (res.status === 200) {
-            let data = await res.json();
-            this.settings.base_url = data.results.api[0][0];
+        try {
+            const url = "https://api.copy-manga.com/api/v3/system/network2?platform=3";
+            const res = await Network.get(url, this.appHeaders);
+            const host = this.parseResponse(res).api?.[0]?.[0];
+            if (typeof host !== 'string' || !/^api\.copy[0-9]+\.(?:com|online)$/.test(host)) {
+                throw 'Invalid official API host';
+            }
+            this._appApi = host;
+        } catch (error) {
+            // Discovery is optional; keep the known default and settings schema.
+            // Business requests still surface their actual network/API failures.
+            console.error(`App API discovery failed: ${error}`);
         }
     }
 }
