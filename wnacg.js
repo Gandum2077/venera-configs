@@ -7,7 +7,7 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.0.10"
+    version = "1.0.12"
 
     minAppVersion = "1.0.0"
 
@@ -29,7 +29,7 @@ class Wnacg extends ComicSource {
     contentDomain(domain) {
         domain = domain.trim()
         // This site's bare host redirects POSTs to www. Use one cookie origin.
-        return domain.toLowerCase() === 'wn003.cfd' ? 'www.wn003.cfd' : domain
+        return /^(?:wn003\.cfd|wnacg\.com)$/i.test(domain) ? `www.${domain.toLowerCase()}` : domain
     }
 
     get baseUrl() {
@@ -54,6 +54,15 @@ class Wnacg extends ComicSource {
             return `https://${this.contentDomain(domain)}`
         }
     }
+
+    get accountBaseUrl() {
+        // Keep browser cookies on their original host, even when public browsing
+        // uses a custom mirror. Never copy session/clearance cookies across sites.
+        return this.loadData('webLoginOrigin') === 'https://www.wnacg.com'
+            ? 'https://www.wnacg.com' : this.baseUrl
+    }
+
+    _webLoginReady = false
 
     overwriteDomains(domains) {
         if (domains.length != 0) {
@@ -96,6 +105,8 @@ class Wnacg extends ComicSource {
             }
             // Match the site's AJAX protocol, independently of its UI wording.
             if (json.ret === true || json.ret === 1 || json.ret === '1') {
+                this.deleteData('webLoginOrigin')
+                this._webLoginReady = false
                 return 'ok'
             }
             let message = typeof json.html === 'string' ? json.html : ''
@@ -104,14 +115,56 @@ class Wnacg extends ComicSource {
                 if (value) message = message.replaceAll(value, '[redacted]')
             }
             message = message.replace(/\s+/g, ' ').trim().slice(0, 180)
+            if (/滑[塊块]|人[機机][驗验][證证]|slider_pass|captcha/i.test(message)) {
+                throw 'Login failed: 網站需要滑塊驗證，請使用「網頁登入」完成驗證，登入後打開「我的收藏」'
+            }
             throw `Login failed${message ? ': ' + message : ': credentials rejected'}`
+        },
+
+        loginWithWebview: {
+            // Native Venera reads this before source settings are available.
+            // The complete document loads the site's official slider UI.
+            url: 'https://www.wnacg.com/users-login.html',
+            checkStatus: (url, title) => {
+                this._webLoginReady = false
+                if (typeof url !== 'string' || typeof title !== 'string') return false
+                // Anonymous private URLs also return HTTP 200. A login, challenge
+                // or permission page must never close the browser as a success.
+                if (!/^https:\/\/www\.wnacg\.com\/users-(?:users_fav|index)\.html(?:\?[^#]*)?$/.test(url) ||
+                    !/(?:紳士漫畫|绅士漫画)/.test(title) ||
+                    !/我的空间|我的空間/.test(title) ||
+                    /登[錄录入]|login|sign\s*in|註冊|注册|register|滑[塊块]|驗證|验证|captcha|challenge|just a moment|cloudflare|checking|權限|权限|錯誤|错误|error|forbidden|denied|not found|\b40[134]\b/i.test(title)) return false
+                this._webLoginReady = true
+                return true
+            },
+            onLoginSuccess: () => {
+                // The native host imports cookies before this synchronous callback;
+                // it does not await promises. Cookie presence is a bridge check,
+                // not proof of authentication; favorites still validate the server.
+                try {
+                    if (!this._webLoginReady) throw '請完成網頁登入後打開「我的收藏」'
+                    let cookies = Network.getCookies('https://www.wnacg.com')
+                    if (!Array.isArray(cookies) || !cookies.some(cookie => cookie &&
+                        typeof cookie.name === 'string' && cookie.name.trim() &&
+                        typeof cookie.value === 'string' && cookie.value.trim())) {
+                        throw '未取得網頁登入 Cookie，請重新登入'
+                    }
+                    this.saveData('webLoginOrigin', 'https://www.wnacg.com')
+                    this.deleteData('_localStorage')
+                } finally { this._webLoginReady = false }
+            },
         },
 
         /**
          * logout function, clear account related data
          */
         logout: () => {
-            Network.deleteCookies(this.baseUrl)
+            let origins = new Set([this.accountBaseUrl, this.baseUrl, 'https://www.wnacg.com'])
+            for (let origin of origins) Network.deleteCookies(origin)
+            this.deleteData('webLoginOrigin')
+            this.deleteData('_localStorage')
+            this.deleteData('account')
+            this._webLoginReady = false
         },
 
         // {string?} - register url
@@ -213,13 +266,13 @@ class Wnacg extends ComicSource {
         }
     }
 
-    absoluteUrl(value) {
+    absoluteUrl(value, base = this.baseUrl) {
         value = String(value || '').trim()
         if (/^https?:\/\//i.test(value)) return value
         // The site's detail cover currently starts with four slashes.
         if (/^\/{2,}/.test(value)) return 'https://' + value.replace(/^\/+/, '')
         if (!value || /^[a-z][a-z0-9+.-]*:/i.test(value)) throw 'Invalid image or link URL'
-        return this.baseUrl + (value.startsWith('/') ? '' : '/') + value
+        return base + (value.startsWith('/') ? '' : '/') + value
     }
 
     responseText(body) {
@@ -269,6 +322,8 @@ class Wnacg extends ComicSource {
 
     checkFavoriteSession(document) {
         if (document.querySelector('form#login_form, input[name="login_name"]')) throw 'Login expired'
+        let notice = document.querySelector('#center_box .title.title_c')
+        if (notice && /(?:[沒没]有[權权]限|需要登[錄录入])/.test(notice.text)) throw 'Login expired'
     }
 
     favoriteFolders(document) {
@@ -637,12 +692,12 @@ class Wnacg extends ComicSource {
                     if (!found) return 'ok'
                     favoriteId = found.favoriteId
                 }
-                let res = await Network.get(`${this.baseUrl}/users-fav_del-id-${favoriteId}.html?ajax=true&_t=${randomDouble(0, 1)}`, { 'cache-time': 'no' })
+                let res = await Network.get(`${this.accountBaseUrl}/users-fav_del-id-${favoriteId}.html?ajax=true&_t=${randomDouble(0, 1)}`, { 'cache-time': 'no' })
                 if (res.status !== 200) {
                     throw 'Delete failed'
                 }
             } else {
-                let res = await Network.post(`${this.baseUrl}/users-save_fav-id-${comicId}.html`, {
+                let res = await Network.post(`${this.accountBaseUrl}/users-save_fav-id-${comicId}.html`, {
                     'content-type': 'application/x-www-form-urlencoded'
                 }, `favc_id=${folderId}`)
                 if (res.status !== 200) {
@@ -659,13 +714,13 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{folders: {[p: string]: string}, favorited: string[]}>} - `folders` is a map of folder id to folder name, `favorited` is a list of folder id which contains the comic
          */
         loadFolders: async (comicId) => {
-            let document = new HtmlDocument(await this.getPage(`${this.baseUrl}/users-users_fav.html`, { 'cache-time': 'no' }))
+            let document = new HtmlDocument(await this.getPage(`${this.accountBaseUrl}/users-users_fav.html`, { 'cache-time': 'no' }))
             let folders
             try { folders = this.favoriteFolders(document) }
             finally { document.dispose() }
             if (comicId === undefined || comicId === null || comicId === '') return { folders: folders, favorited: [] }
 
-            let popup = new HtmlDocument(await this.getPage(`${this.baseUrl}/users-addfav-id-${comicId}.html`, { 'cache-time': 'no' }))
+            let popup = new HtmlDocument(await this.getPage(`${this.accountBaseUrl}/users-addfav-id-${comicId}.html`, { 'cache-time': 'no' }))
             try {
                 this.checkFavoriteSession(popup)
                 if (popup.querySelector('form select[name="favc_id"]')) return { folders: folders, favorited: [] }
@@ -683,7 +738,7 @@ class Wnacg extends ComicSource {
          * @returns {Promise<any>} - return any value to indicate success
          */
         addFolder: async (name) => {
-            let res = await Network.post(`${this.baseUrl}/users-favc_save-id.html`, {
+            let res = await Network.post(`${this.accountBaseUrl}/users-favc_save-id.html`, {
                 'content-type': 'application/x-www-form-urlencoded'
             }, `favc_name=${encodeURIComponent(name)}`)
             if (res.status !== 200) {
@@ -698,7 +753,7 @@ class Wnacg extends ComicSource {
          */
         deleteFolder: async (folderId) => {
             if (!folderId || String(folderId) === '0') throw 'Cannot delete the All collection view'
-            let res = await Network.get(`${this.baseUrl}/users-favclass_del-id-${folderId}.html?ajax=true&_t=${randomDouble()}`, {})
+            let res = await Network.get(`${this.accountBaseUrl}/users-favclass_del-id-${folderId}.html?ajax=true&_t=${randomDouble()}`, {})
             if (res.status !== 200) {
                 throw 'Delete failed'
             }
@@ -712,7 +767,7 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{comics: Comic[], maxPage: number}>}
          */
         loadComics: async (page, folder) => {
-            let url = `${this.baseUrl}/users-users_fav-page-${page}-c-${folder || '0'}.html`
+            let url = `${this.accountBaseUrl}/users-users_fav-page-${page}-c-${folder || '0'}.html`
             let document = new HtmlDocument(await this.getPage(url, { 'cache-time': 'no' }))
             try {
                 this.checkFavoriteSession(document)
@@ -733,7 +788,7 @@ class Wnacg extends ComicSource {
                         id: id[1],
                         title: title.text.trim(),
                         subtitle: time ? time.text.replaceAll('創建時間：', '').trim() : '',
-                        cover: this.absoluteUrl(cover.attributes.src),
+                        cover: this.absoluteUrl(cover.attributes.src, this.accountBaseUrl),
                         description: info,
                         maxPage: pages ? Number(pages[1]) : undefined,
                         favoriteId: favoriteId[1],
@@ -915,7 +970,7 @@ class Wnacg extends ComicSource {
                 title: "Custom Domain",
                 type: "input",
                 validator: String.raw`^(?!:\/\/)(?=.{1,253})([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`,
-                default: 'wnacg.com',
+                default: 'www.wnacg.com',
             },
         }
     }
