@@ -1,12 +1,18 @@
 # venera-configs
 
+Configuration file repository for venera
+
+## 漫画源仓库地址 / Comic Sources Repo URL
+
+```
+https://cdn.jsdelivr.net/gh/Gandum2077/venera-configs/index.json
+```
+
 ## AI 自动维护 / AI-powered maintenance
 
 本分支由 AI 自动巡检和维护，持续检查配置的可用性并修复发现的问题。你可以通过 [Issues](https://github.com/Gandum2077/venera-configs/issues) 反馈漫画源相关的问题，或者提出漫画源功能、兼容性和使用体验方面的关键改进建议。报告问题时，请尽量提供受影响的漫画源、应用版本、复现步骤，以及相关错误信息或截图，并注意隐去账号、密码、Cookie 等敏感信息，便于定位和处理。
 
 This branch is automatically monitored and maintained by AI, which checks configuration availability and fixes detected issues. You can use [Issues](https://github.com/Gandum2077/venera-configs/issues) to report problems with comic sources and suggest key improvements to their functionality, compatibility, and user experience. To help diagnose and resolve problems, please include the affected comic source, app version, steps to reproduce, and relevant error messages or screenshots. Redact sensitive information such as account details, passwords, and cookies before submitting.
-
-Configuration file repository for venera
 
 ## Create a new configuration
 
